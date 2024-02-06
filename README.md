@@ -163,3 +163,5 @@ Another setting is to train the entire network without any disease masking. You 
 }
 ```
 # Drug_Repurposing_GNN
+# SSL-DiseaseDrug-Prediction
+Semi supervised Learning for Disease-Drug Relation
