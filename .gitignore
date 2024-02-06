@@ -9,6 +9,8 @@ __pycache__/
 ## csv or pkl
 *.csv
 *.pkl
+*.txt
+*.out
 
 # Distribution / packaging
 .Python
