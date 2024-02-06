@@ -4,7 +4,7 @@ import argparse
 import copy
 import pickle
 from argparse import ArgumentParser
-
+import time
 import numpy as np
 import pandas as pd
 from tqdm.auto import tqdm
@@ -38,7 +38,7 @@ class TxGNN:
                        weight_bias_track = False,
                        proj_name = 'TxGNN',
                        exp_name = 'TxGNN',
-                       device = 'cuda:0'):
+                       device = 'cuda'):
         self.device = torch.device(device)
         self.weight_bias_track = weight_bias_track
         self.G = data.G
@@ -47,6 +47,7 @@ class TxGNN:
         self.disease_eval_idx = data.disease_eval_idx
         self.split = data.split
         self.no_kg = data.no_kg
+        self.additional_train = data.additional_train
         
         self.disease_rel_types = ['rev_contraindication', 'rev_indication', 'rev_off-label use']
         
@@ -77,7 +78,9 @@ class TxGNN:
                                exp_lambda = 0.7,
                                num_walks = 200,
                                walk_mode = 'bit',
-                               path_length = 2):
+                               path_length = 2,
+                               dropout = False,
+                               reparam_mode=False):
         
         if self.no_kg and proto:
             print('Ablation study on No-KG. No proto learning is used...')
@@ -118,7 +121,9 @@ class TxGNN:
                    split = self.split,
                    data_folder = self.data_folder,
                    exp_lambda = exp_lambda,
-                   device = self.device
+                   device = self.device,
+                   dropout=dropout,
+                   reparam_mode=reparam_mode,
                   ).to(self.device)    
         self.best_model = self.model
         
@@ -137,25 +142,33 @@ class TxGNN:
             batch_size=batch_size,
             shuffle=True,
             drop_last=False,
-            num_workers=0)
+            num_workers=2)
         
         optimizer = torch.optim.AdamW(self.model.parameters(), lr = learning_rate)
 
         print('Start pre-training with #param: %d' % (get_n_params(self.model)))
 
         for epoch in range(n_epoch):
-
+            strt = time.time()
             for step, (nodes, pos_g, neg_g, blocks) in enumerate(dataloader):
 
                 blocks = [i.to(self.device) for i in blocks]
                 pos_g = pos_g.to(self.device)
                 neg_g = neg_g.to(self.device)
-                pred_score_pos, pred_score_neg, pos_score, neg_score = self.model.forward_minibatch(pos_g, neg_g, blocks, self.G, mode = 'train', pretrain_mode = True)
+
+                pred_score_pos, pred_score_neg, pos_score, neg_score, beta_kl_loss = self.model.forward_minibatch(pos_g, neg_g, blocks, self.G, mode = 'train', pretrain_mode = True)
+                ## I assume the above code does a neighborhood sampling and uses those edges to compute the loss. How could we reimplement this so that we can have labels but not edges? 
+                # print(f"blocks: {blocks}")
+                # print(f"pred_score_pos: {pred_score_pos}")
+                # print(f"pred_score_neg: {pred_score_neg}")
+                # print(f"pos_score: {pos_score}")
+                # print(f"neg_score: {neg_score}")
+                # break
 
                 scores = torch.cat((pos_score, neg_score)).reshape(-1,)
                 labels = [1] * len(pos_score) + [0] * len(neg_score)
 
-                loss = F.binary_cross_entropy(scores, torch.Tensor(labels).float().to(self.device))
+                loss = F.binary_cross_entropy(scores, torch.Tensor(labels).float().to(self.device)) + beta_kl_loss
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
@@ -179,7 +192,8 @@ class TxGNN:
                                   'pretraining_macro_auroc': macro_auroc,
                                   'pretraining_micro_auprc': micro_auprc, 
                                   'pretraining_macro_auprc': macro_auprc})
-                    
+                    print(time.time() - strt)
+                    strt = time.time()
                     print('Epoch: %d Step: %d LR: %.5f Loss %.4f, Pretrain Micro AUROC %.4f Pretrain Micro AUPRC %.4f Pretrain Macro AUROC %.4f Pretrain Macro AUPRC %.4f' % (
                         epoch,
                         step,
@@ -197,7 +211,8 @@ class TxGNN:
                        train_print_per_n = 5, 
                        valid_per_n = 25,
                        sweep_wandb = None,
-                       save_name = None):
+                       save_name = None,
+                       weight_decay = 0):
         
         best_val_acc = 0
 
@@ -205,20 +220,38 @@ class TxGNN:
         neg_sampler = Full_Graph_NegSampler(self.G, 1, 'fix_dst', self.device)
         torch.nn.init.xavier_uniform(self.model.w_rels) # reinitialize decoder
         
-        optimizer = torch.optim.AdamW(self.model.parameters(), lr = learning_rate)
+        optimizer = torch.optim.AdamW(self.model.parameters(), lr = learning_rate, weight_decay=weight_decay)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', 0.8)
         
+        strt = time.time()
         for epoch in range(n_epoch):
             negative_graph = neg_sampler(self.G)
-            pred_score_pos, pred_score_neg, pos_score, neg_score = self.model(self.G, negative_graph, pretrain_mode = False, mode = 'train')
+            pred_score_pos, pred_score_neg, pos_score, neg_score, beta_kl_loss = self.model(self.G, negative_graph, pretrain_mode = False, mode = 'train')
 
             pos_score = torch.cat([pred_score_pos[i] for i in self.dd_etypes])
             neg_score = torch.cat([pred_score_neg[i] for i in self.dd_etypes])
 
             scores = torch.sigmoid(torch.cat((pos_score, neg_score)).reshape(-1,))
             labels = [1] * len(pos_score) + [0] * len(neg_score)
-            loss = F.binary_cross_entropy(scores, torch.Tensor(labels).float().to(self.device))
+            loss = F.binary_cross_entropy(scores, torch.Tensor(labels).float().to(self.device)) + beta_kl_loss
             optimizer.zero_grad()
+
+            if self.additional_train is not None:
+                ## second loss with psuedo labels
+                ## Things Omar could do:
+                ## Instead of just binary ones or zeros, need probabilities
+                ## Test out psuedo labels with negative sampling too. How does neg_sampler work?
+                g_psuedo_labels = dgl.heterograph(self.additional_train, num_nodes_dict = {ntype: self.G.number_of_nodes(ntype) for ntype in self.G.ntypes}, device=self.device)
+                ###
+                
+#                 scores = self.additional_train['score'].astype(float).to_numpy()
+#                 print('Shapes:' , psuedo_scores.shape, len(scores))
+#                 loss = loss + F.binary_cross_entropy(torch.sigmoid(psuedo_scores), scores)
+                
+                ###
+                _, psuedo_rel_scores, _, psuedo_scores, _ = self.model(self.G, g_psuedo_labels, psuedo=True)
+                loss = loss + F.binary_cross_entropy(torch.sigmoid(psuedo_scores), torch.ones(psuedo_scores.shape, device=self.device))
+
             loss.backward()
             optimizer.step()
             scheduler.step(loss)
@@ -256,7 +289,9 @@ class TxGNN:
             if (epoch) % valid_per_n == 0:
                 # validation tracking...
                 print('Validation.....')
+                self.model.eval()
                 (auroc_rel, auprc_rel, micro_auroc, micro_auprc, macro_auroc, macro_auprc), loss = evaluate_fb(self.model, self.g_valid_pos, self.g_valid_neg, self.G, self.dd_etypes, self.device, mode = 'valid')
+                self.model.train()
 
                 if best_val_acc < macro_auroc:
                     best_val_acc = macro_auroc
@@ -295,9 +330,12 @@ class TxGNN:
                                   })
 
                     self.wandb.log(temp_d)
-        
-        print('Testing...')
 
+                print(time.time() - strt)
+                strt = time.time()
+
+        print('Testing...')
+        self.model.eval()
         (auroc_rel, auprc_rel, micro_auroc, micro_auprc, macro_auroc, macro_auprc), loss, pred_pos, pred_neg = evaluate_fb(self.best_model, self.g_test_pos, self.g_test_neg, self.G, self.dd_etypes, self.device, True, mode = 'test')
 
         print('Testing Loss %.4f Testing Micro AUROC %.4f Testing Micro AUPRC %.4f Testing Macro AUROC %.4f Testing Macro AUPRC %.4f' % (
@@ -355,9 +393,8 @@ class TxGNN:
             src = torch.Tensor(df_temp.x_idx.values).to(self.device).to(dtype = torch.int64)
             dst = torch.Tensor(df_temp.y_idx.values).to(self.device).to(dtype = torch.int64)
             out.update({etype: (src, dst)})
-        g_eval = dgl.heterograph(out, num_nodes_dict={ntype: g.number_of_nodes(ntype) for ntype in g.ntypes})
+        g_eval = dgl.heterograph(out, num_nodes_dict={ntype: g.number_of_nodes(ntype) for ntype in g.ntypes}, device=self.device)
         
-        g_eval = g_eval.to(self.device)
         g = g.to(self.device)
         self.model.eval()
         pred_score_pos, pred_score_neg, pos_score, neg_score = self.model(g, 
@@ -686,7 +723,7 @@ class TxGNN:
             df_temp[self.relation + '_layer1_att'] = scores[0][etype].reshape(-1,)
             df_temp[self.relation + '_layer2_att'] = scores[1][etype].reshape(-1,)
 
-            all_att_df = all_att_df.append(df_temp)
+            all_att_df = pd.concat([all_att_df, df_temp], ignore_index=True)
         
         all_att_df.to_pickle(os.path.join(path, 'graphmask_output_' + self.relation + '.pkl'))
         return all_att_df

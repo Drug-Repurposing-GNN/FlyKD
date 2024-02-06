@@ -29,7 +29,10 @@ class TxData:
     def prepare_split(self, split = 'complex_disease',
                      disease_eval_idx = None,
                      seed = 42,
-                     no_kg = False):
+                     no_kg = False,
+                     additional_train=None,
+                     create_psuedo_edges=False,
+                     drop_dup_all=False):
         
         if split not in ['random', 'complex_disease', 'disease_eval', 'cell_proliferation', 'mental_health', 'cardiovascular', 'anemia', 'adrenal_gland', 'full_graph', 'downstream_pred']:
             raise ValueError("Please select one of the following supported splits: 'random', 'complex_disease', 'disease_eval', 'cell_proliferation', 'mental_health', 'cardiovascular', 'anemia', 'adrenal_gland'")
@@ -80,21 +83,51 @@ class TxData:
             print('Splits detected... Loading splits....')
             df_train = pd.read_csv(os.path.join(split_data_path, 'train.csv'))
             df_valid = pd.read_csv(os.path.join(split_data_path, 'valid.csv'))
-            df_test = pd.read_csv(os.path.join(split_data_path, 'test.csv'))
-        
+            df_test = pd.read_csv(os.path.join(split_data_path, 'test.csv'))     
+            
         if split not in ['random', 'complex_disease', 'disease_eval', 'full_graph', 'downstream_pred']:
             # in disease area split
             df_test = process_disease_area_split(self.data_folder, df, df_test, split)
-        
+
+        ## I see duplicate rows? 
+        df_train = df_train.drop_duplicates() ## To keep things the same.
+        if drop_dup_all:
+            df_valid = df_valid.drop_duplicates()       
+            df_test = df_test.drop_duplicates() 
+
+        # add additional training data (w/ self-supervised edges)
+        if additional_train is not None and create_psuedo_edges:
+            # ids = pd.concat([df_train[df_train.x_type == "drug"]['x_idx'], df_train[df_train.y_type == "drug"]['y_idx']]).unique()
+            # print(len(ids))
+            df_train = df_train.append(additional_train, ignore_index=True).drop_duplicates()
+            # ids = pd.concat([df_train[df_train.x_type == "drug"]['x_idx'], df_train[df_train.y_type == "drug"]['y_idx']]).unique()
+            # print(len(ids))
+
         print('Creating DGL graph....')
         # create dgl graph
-        g = create_dgl_graph(df_train, df)
-         
+        g = create_dgl_graph(df_train, df) ## df is here to obtain the highest index number which is required to create a contiguous DGL graph
+        
+        ## add additional training data (self-supervised data)
+        if additional_train is not None and create_psuedo_edges is False:
+            ## create dictionaries with relation so that we could create a dgl.graph easily
+            rel_dict = {}
+            src = df[df.relation == 'contraindication'].y_idx.astype(int).values
+            dst = df[df.relation == 'contraindication'].x_idx.astype(int).values
+            src_ind = df[df.relation == 'indication'].y_idx.astype(int).values
+            dst_ind = df[df.relation == 'indication'].x_idx.astype(int).values
+            rel_dict.update({('disease', 'rev_contraindication', 'drug'): (src, dst)})
+            rel_dict.update({('disease', 'rev_indication', 'drug'): (src_ind, dst_ind)})
+            self.additional_train = rel_dict
+        else:
+            self.additional_train = None
+
         self.G = g         
         self.df, self.df_train, self.df_valid, self.df_test = df, df_train, df_valid, df_test
         self.disease_eval_idx = disease_eval_idx
         self.no_kg = no_kg
         self.seed = seed
+        print(f"additional ")
+        # print(f"additional ")
         print('Done!')
         
         

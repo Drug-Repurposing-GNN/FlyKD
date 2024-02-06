@@ -117,7 +117,7 @@ class DistMultPredictor(nn.Module):
         score = torch.sum(h_u * h_r * h_v, dim=1)
         return {'score': score}
 
-    def forward(self, graph, G, h, pretrain_mode, mode, block = None, only_relation = None):
+    def forward(self, graph, G, h, pretrain_mode, mode, block = None, only_relation = None, psuedo=False):
         with graph.local_scope():
             scores = {}
             s_l = []
@@ -127,7 +127,9 @@ class DistMultPredictor(nn.Module):
             else:
                 etypes_train = self.etypes_dd
             
-            if only_relation is not None:
+            if psuedo:
+                etypes_train = graph.canonical_etypes
+            elif only_relation is not None:
                 if only_relation == 'indication':
                     etypes_train = [('drug', 'indication', 'disease'),
                                     ('disease', 'rev_indication', 'drug')]
@@ -139,7 +141,7 @@ class DistMultPredictor(nn.Module):
                                    ('disease', 'rev_off-label use', 'drug')]
                 else:
                     return ValueError
-            
+
             graph.ndata['h'] = h
             
             if pretrain_mode:
@@ -279,7 +281,7 @@ class DistMultPredictor(nn.Module):
                         h[dst][dst_rel_idx] = dst_h
                 
                 
-            if pretrain_mode:
+            if pretrain_mode or psuedo:
                 s_l = torch.cat(s_l)             
             else: 
                 s_l = torch.cat(s_l).reshape(-1,).detach().cpu().numpy()
@@ -441,7 +443,7 @@ class HeteroRGCNLayer(nn.Module):
         return {ntype : G.nodes[ntype].data['h'] for ntype in G.ntypes}, penalty, self.num_masked
     
 class HeteroRGCN(nn.Module):
-    def __init__(self, G, in_size, hidden_size, out_size, attention, proto, proto_num, sim_measure, bert_measure, agg_measure, num_walks, walk_mode, path_length, split, data_folder, exp_lambda, device):
+    def __init__(self, G, in_size, hidden_size, out_size, attention, proto, proto_num, sim_measure, bert_measure, agg_measure, num_walks, walk_mode, path_length, split, data_folder, exp_lambda, device, dropout=False, reparam_mode=False):
         super(HeteroRGCN, self).__init__()
 
         if attention:
@@ -450,7 +452,8 @@ class HeteroRGCN(nn.Module):
         else:
             self.layer1 = HeteroRGCNLayer(in_size, hidden_size, G.etypes)
             self.layer2 = HeteroRGCNLayer(hidden_size, out_size, G.etypes)
-        
+
+            
         self.w_rels = nn.Parameter(torch.Tensor(len(G.canonical_etypes), out_size))
         nn.init.xavier_uniform_(self.w_rels, gain=nn.init.calculate_gain('relu'))
         rel2idx = dict(zip(G.canonical_etypes, list(range(len(G.canonical_etypes)))))
@@ -461,19 +464,99 @@ class HeteroRGCN(nn.Module):
         self.hidden_size = hidden_size
         self.out_size = out_size
         self.etypes = G.etypes
+
+        self.dropout = dropout    
+        self.total_nodes = G.num_nodes() ## Maybe try only the num of fine-tuning labels count?
+        self.reparam_mode = reparam_mode
+        if reparam_mode:
+            if reparam_mode not in {"RMLP", "MPNN", "MLP"}:
+                raise NameError
+            if self.reparam_mode == "MPNN":
+                self.layer3 = HeteroRGCNLayer(hidden_size, out_size, G.etypes)
+            ## elif shared MLP reparmeterization:
+            elif self.reparam_mode == "MLP":
+                self.mlp_mean = nn.Sequential(
+                    nn.Linear(out_size, 2*out_size),
+                    nn.LeakyReLU(),
+                    nn.Linear(2*out_size, out_size),
+                )
+                self.mlp_logvar = nn.Sequential(
+                    nn.Linear(out_size, 2*out_size),
+                    nn.LeakyReLU(),
+                    nn.Linear(2*out_size, out_size),
+                )
+            # else relational MLP reparameterization:
+            elif self.reparam_mode == "RMLP":
+                self.mlp_mean = nn.ModuleDict({
+                    name : nn.Sequential(
+                        nn.Linear(out_size, 2*out_size),
+                        nn.LeakyReLU(),
+                        nn.Linear(2*out_size, out_size),
+                    ) for name in G.ntypes
+                    })
+                self.mlp_logvar = nn.ModuleDict({
+                    name : nn.Sequential(
+                        nn.Linear(out_size, 2*out_size),
+                        nn.LeakyReLU(),
+                        nn.Linear(2*out_size, out_size),
+                    ) for name in G.ntypes
+                    })
+                
+    def total_kl_loss(self, mu_dict=None, logstd_dict=None):
+        total_kl_div = 0
+        MAX_LOGSTD = 10
+        for key in mu_dict.keys():
+            mu = mu_dict[key]
+            logstd = logstd_dict[key].clamp(max=MAX_LOGSTD)
+            total_kl_div += -0.5 * torch.mean(torch.sum(1 + 2 * logstd - mu**2 - logstd.exp()**2, dim=1))
+        return total_kl_div
+    
+    def reparameterize(self, mean_dict, logvar_dict, train=False):
+        if train: ## add noise
+            z_dict = {}
+            for ntype in mean_dict:
+                std = torch.exp(0.5 * logvar_dict[ntype])
+                eps = torch.randn_like(std)
+                z_dict[ntype] = mean_dict[ntype] + std * eps
+            return z_dict
+        else:
+            # for ntype in mean_dict:
+            #     z_dict[ntype] = mean_dict[ntype]
+            # return z_dict
+            return mean_dict ## doing the same as above code? 
         
     def forward_minibatch(self, pos_G, neg_G, blocks, G, mode = 'train', pretrain_mode = False):
         input_dict = blocks[0].srcdata['inp']
         h_dict = self.layer1(blocks[0], input_dict)
         h_dict = {k : F.leaky_relu(h) for k, h in h_dict.items()}
-        h = self.layer2(blocks[1], h_dict)
         
+        ## three versions of reparameterization. Only MPNN reparam utilizes layer 2 differently
+        beta_kl_loss = 0
+        if self.reparam_mode != "MPNN":
+            h = self.layer2(blocks[1], h_dict)
+        if self.reparam_mode: ## if string, it is True in Boolean
+            mean_dict = {}
+            logvar_dict = {}
+            if self.reparam_mode == "MPNN":
+                mean_dict = self.layer2(blocks[1], h_dict)
+                logvar_dict = self.layer3(blocks[1], h_dict)
+            elif self.reparam_mode == "MLP":
+                for ntype in h:
+                    mean_dict[ntype] = self.mlp_mean(h[ntype])
+                    logvar_dict[ntype] = self.mlp_logvar(h[ntype])
+            elif self.reparam_mode == "RMLP":
+                for ntype in h:
+                    mean_dict[ntype] = self.mlp_mean[ntype](h[ntype])
+                    logvar_dict[ntype] = self.mlp_logvar[ntype](h[ntype])
+            h = self.reparameterize(mean_dict, logvar_dict, self.training) ## pre-training doesn't do validation
+            beta_kl_loss = self.total_kl_loss(mean_dict, logvar_dict) / self.total_nodes
+
         scores, out_pos = self.pred(pos_G, G, h, pretrain_mode, mode = mode + '_pos', block = blocks[1])
         scores_neg, out_neg = self.pred(neg_G, G, h, pretrain_mode, mode = mode + '_neg', block = blocks[1])
-        return scores, scores_neg, out_pos, out_neg
+        return scores, scores_neg, out_pos, out_neg, beta_kl_loss
         
     
-    def forward(self, G, neg_G, eval_pos_G = None, return_h = False, return_att = False, mode = 'train', pretrain_mode = False):
+    def forward(self, G, neg_G, eval_pos_G = None, return_h = False, return_att = False, mode = 'train', pretrain_mode = False, psuedo=False):
         with G.local_scope():
             input_dict = {ntype : G.nodes[ntype].data['inp'] for ntype in G.ntypes}
 
@@ -483,9 +566,32 @@ class HeteroRGCN(nn.Module):
                 h, a_dict_l2 = self.layer2(G, h_dict, return_att)
             else:
                 h_dict = self.layer1(G, input_dict)
-                h_dict = {k : F.leaky_relu(h) for k, h in h_dict.items()}
-                h = self.layer2(G, h_dict)
+                if self.dropout:
+                    h_dict = {k : F.dropout(F.leaky_relu(h), p=0.1) for k, h in h_dict.items()}
+                else:
+                    h_dict = {k : F.leaky_relu(h) for k, h in h_dict.items()}
 
+                ## three versions of reparameterization. Only MPNN reparam utilizes layer 2 differently
+                beta_kl_loss = 0
+                if self.reparam_mode != "MPNN":
+                    h = self.layer2(G, h_dict)
+                if self.reparam_mode: ## if string, it is True in Boolean
+                    mean_dict = {}
+                    logvar_dict = {}
+                    if self.reparam_mode == "MPNN":
+                        mean_dict = self.layer2(G, h_dict)
+                        logvar_dict = self.layer3(G, h_dict)
+                    elif self.reparam_mode == "MLP":
+                        for ntype in h:
+                            mean_dict[ntype] = self.mlp_mean(h[ntype])
+                            logvar_dict[ntype] = self.mlp_logvar(h[ntype])
+                    elif self.reparam_mode == "RMLP":
+                        for ntype in h:
+                            mean_dict[ntype] = self.mlp_mean[ntype](h[ntype])
+                            logvar_dict[ntype] = self.mlp_logvar[ntype](h[ntype])
+                    h = self.reparameterize(mean_dict, logvar_dict, eval_pos_G is not None and self.training) ## turned off during eval
+                    beta_kl_loss = self.total_kl_loss(mean_dict, logvar_dict) / self.total_nodes
+                    
             if return_h:
                 return h
 
@@ -497,11 +603,14 @@ class HeteroRGCN(nn.Module):
                 # eval mode
                 scores, out_pos = self.pred(eval_pos_G, G, h, pretrain_mode, mode = mode + '_pos')
                 scores_neg, out_neg = self.pred(neg_G, G, h, pretrain_mode, mode = mode + '_neg')
-                return scores, scores_neg, out_pos, out_neg
+                return scores, scores_neg, out_pos, out_neg, beta_kl_loss
+            elif psuedo: ## useful for only producing the relation score on neg_G
+                scores_neg, out_neg = self.pred(neg_G, G, h, pretrain_mode, mode = mode + '_neg', psuedo=True)
+                return None, scores_neg, None, out_neg, 0
             else:
                 scores, out_pos = self.pred(G, G, h, pretrain_mode, mode = mode + '_pos')
                 scores_neg, out_neg = self.pred(neg_G, G, h, pretrain_mode, mode = mode + '_neg')
-                return scores, scores_neg, out_pos, out_neg
+                return scores, scores_neg, out_pos, out_neg, beta_kl_loss
     
     def graphmask_forward(self, G, pos_graph, neg_graph, graphmask_mode = False, return_gates = False, only_relation = None):
         with G.local_scope():

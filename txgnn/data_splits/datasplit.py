@@ -17,7 +17,7 @@ class DataSplitter:
         
     def load_kg(self, pth=''):
         kg = pd.read_csv(pth+'kg.csv', low_memory=False)
-        nodes = pd.read_csv(pth+'nodes.csv', low_memory=False)
+        nodes = pd.read_csv(pth+'node.csv', low_memory=False) ## should be node.csv instead of nodes.csv?
         edges = pd.read_csv(pth+'edges.csv', low_memory=False)
         return kg, nodes, edges
     
