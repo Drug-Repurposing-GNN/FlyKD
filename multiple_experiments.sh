@@ -1,3 +1,39 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## Things to try:
+## use KL divergence loss instead of CE
+## try evaluation (valid/test) without DPM
+
+## Running
+## No negative sampling
+nohup python -u noisy_student.py --psuedo_label_fname psuedo_scores_top20.csv --soft_pseudo --student_size 100 --set_seed 1 > ./logs/soft_pseudo_labels_top20_no_neg_sampling_KL.txt 2>&1
+## ---
+# nohup python -u noisy_student.py --psuedo_label_fname psuedo_scores_top50.csv --deg inf --k_top_candidates 50 > ./testing/generating.txt 2>&1 ## generating top 50 psuedo scores
+# nohup python -u E_Demo.py --seed 42 > ./logs/normal_42_2.txt 2>&1 ## generating top 50 psuedo scores
+
+# nohup python -u noisy_student.py --psuedo_label_fname psuedo_labels_75000.csv --psuedo_edge > ./logs/75000_psuedo_edges2.txt 2>&1 ## running psuedo edge GNN
+# nohup python -u noisy_student.py --psuedo_label_fname psuedo_labels_75000.csv > ./logs/75000_psuedo_labels.txt 2>&1 ## running psuedo edge GNN
+# nohup python -u E_Demo.py > training_normal.txt ## this should match the original score
+
+# nohup python -u E_Demo.py  --psuedo > testing_training.txt ## hope this at least matches the original score
+# nohup python -u E_Demo.py --psuedo > testing_psuedo_training.txt
+
+# nohup python -u noisy_student.py --psuedo_label_fname psuedo_labels_75000.csv > ./logs/full_75000_psuedo_labels.txt 2>&1 ## generating psuedo_labels
+
 # Note: 2>&1 means log the error as well
 
 ## Noisy Student
@@ -35,11 +71,11 @@
 # nohup python -u noisy_student.py --psuedo_label_fname psuedo_labels_15000.csv --student_size 100 > ./logs/15000_psuedo_labels.txt 2>&1 ## running psuedo edge GNN
 # nohup python -u noisy_student.py --psuedo_label_fname psuedo_labels_75000.csv --student_size 100 > ./logs/75000_psuedo_labels.txt 2>&1 ## running psuedo edge GNN
 
-## Running
-nohup python -u noisy_student.py --psuedo_label_fname pl_least_score_5.5.csv --least_score 5.5 > ./logs/generating.txt 2>&1 ## generating psuedo_labels
-nohup python -u noisy_student.py --psuedo_label_fname pl_least_score_6.csv --least_score 6 > ./logs/generating2.txt 2>&1 ## generating psuedo_labels
+# nohup python -u noisy_student.py --psuedo_label_fname pl_least_score_5.5.csv --least_score 5.5 > ./logs/generating.txt 2>&1 ## generating psuedo_labels
+# nohup python -u noisy_student.py --psuedo_label_fname pl_least_score_6.csv --least_score 6 > ./logs/generating2.txt 2>&1 ## generating psuedo_labels
 
-nohup python -u noisy_student.py --psuedo_label_fname pl_least_score_5.5.csv --student_size 100 > ./logs/least_score5.5_label.txt 2>&1 ## running psuedo edge GNN
-nohup python -u noisy_student.py --psuedo_label_fname pl_least_score_5.5.csv --student_size 100 --psuedo_edges > ./logs/least_score5.5_edges.txt 2>&1 ## running psuedo edge GNN
-nohup python -u noisy_student.py --psuedo_label_fname pl_least_score_6.csv --student_size 100 > ./logs/least_score6_label.txt 2>&1 ## running psuedo edge GNN
-nohup python -u noisy_student.py --psuedo_label_fname pl_least_score_6.csv --student_size 100 --psuedo_edges > ./logs/least_score6_edges.txt 2>&1 ## running psuedo edge GNN
+# nohup python -u noisy_student.py --psuedo_label_fname pl_least_score_5.5.csv --student_size 100 > ./logs/least_score5.5_label.txt 2>&1 ## running psuedo edge GNN
+# nohup python -u noisy_student.py --psuedo_label_fname pl_least_score_5.5.csv --student_size 100 --psuedo_edges > ./logs/least_score5.5_edges.txt 2>&1 ## running psuedo edge GNN
+# nohup python -u noisy_student.py --psuedo_label_fname pl_least_score_6.csv --student_size 100 > ./logs/least_score6_label.txt 2>&1 ## running psuedo edge GNN
+# nohup python -u noisy_student.py --psuedo_label_fname pl_least_score_6.csv --student_size 100 --psuedo_edges > ./logs/least_score6_edges.txt 2>&1 ## running psuedo edge GNN
+

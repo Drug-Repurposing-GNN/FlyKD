@@ -327,7 +327,7 @@ class Full_Graph_NegSampler:
                 etype: -g.out_degrees(etype=etype).float() ** 0.75
                 for etype in g.canonical_etypes
             }
-        elif method == 'fix_dst':
+        elif method == 'fix_dst': ## weight is a binary 0 or 1 tensor in order to allow negative sampling to happen only on nodes with relations
             self.weights = {
                 etype: (g.in_degrees(etype=etype) > 0).float()
                 for etype in g.canonical_etypes
@@ -349,6 +349,8 @@ class Full_Graph_NegSampler:
             temp = construct_negative_graph_each_etype(graph, self.k, etype, self.method, self.weights, self.device)
             if len(temp[etype][0]) != 0:
                 out.update(temp)
+            # else:
+            #     print(self.weights[('disease', 'rev_indication', 'drug')].sum())
             
         return dgl.heterograph(out, num_nodes_dict={ntype: graph.number_of_nodes(ntype) for ntype in graph.ntypes})
         
@@ -596,10 +598,13 @@ def process_df(df_train, edge_dict):
     return df_train
 
 
-def reverse_rel_generation(df, df_valid, unique_rel):
+def reverse_rel_generation(df, df_valid, unique_rel, psuedo=False):
     
     for i in unique_rel.values:
-        temp = df_valid[df_valid.relation == i[1]]
+        if psuedo:
+            temp = df_valid[df_valid.relation == i]
+        else:
+            temp = df_valid[df_valid.relation == i[1]]
         temp = temp.rename(columns={"x_type": "y_type", 
                      "x_id": "y_id", 
                      "x_idx": "y_idx",
@@ -609,7 +614,10 @@ def reverse_rel_generation(df, df_valid, unique_rel):
 
         if i[0] != i[2]:
             # bi identity
-            temp["relation"] = 'rev_' + i[1]
+            if psuedo:
+                temp["relation"] = 'rev_' + i
+            else:
+                temp["relation"] = 'rev_' + i[1]
         df_valid = df_valid.append(temp)
     return df_valid.reset_index(drop = True)
 
@@ -1073,7 +1081,7 @@ def disease_centric_evaluation(df, df_train, df_valid, df_test, data_path, G, mo
 
         return out_dict_mean, out_dict_std
     
-    def get_scores_disease(rel, disease_ids, psuedo=False):
+    def get_scores_disease(rel, disease_ids, disable_dpm=False):
         df_train_valid = pd.concat([df_train, df_valid])
         df_dd = df_test[df_test.relation.isin(disease_rel_types)] ## filters df_test that has the relation of interest
         # df_dd_all = pd.concat([df_train, df_valid, df_test]) ## 
@@ -1115,7 +1123,7 @@ def disease_centric_evaluation(df, df_train, df_valid, df_test, data_path, G, mo
             
             model.eval()
             with torch.no_grad():
-                _, pred_score_rel, _, pred_score, _ = model(G, g_eval, psuedo=psuedo)
+                _, pred_score_rel, _, pred_score, _ = model(G, g_eval, pseudo_training=disable_dpm) 
             pred = pred_score_rel[('disease', rel, 'drug')].reshape(-1,).detach().cpu().numpy()
             lab = {idx2id_drug[i]: labels[i] for i in g_eval.edges()[1].detach().cpu().numpy()}
             preds_contra[idx2id_disease[disease_id]] = {idx2id_drug[i]: pred[idx] for idx, i in enumerate(g_eval.edges()[1].detach().cpu().numpy())}
@@ -1208,7 +1216,7 @@ def disease_centric_evaluation(df, df_train, df_valid, df_test, data_path, G, mo
     
         temp_d, preds_all, labels_all, org_out_all, metrics_all, ranked_Ids, ranked_list, name, dis_id, dis_idx, ranked_Idxs, ranked_scores = {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
         rel_type = 'rev_' + relation ## Q. why add rev_ ??
-        preds_, labels_, drug_idxs, drug_names = get_scores_disease(rel_type, disease_ids, psuedo=True)
+        preds_, labels_, drug_idxs, drug_names = get_scores_disease(rel_type, disease_ids, disable_dpm=False) ## Think we still need dpm? Can also try without it and see if pseudo labels can replace them. 
         preds_all[rel_type] = preds_ ## Q. shouldn't the rel_type be in the dictionary as key then? A. No, because we are returning preds_all[relation] not preds_all
         labels_all[rel_type] = labels_
         ids_all = list(preds_all[rel_type].keys())

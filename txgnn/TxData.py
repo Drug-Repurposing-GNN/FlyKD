@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 from tqdm.auto import tqdm
 import dgl
+from .utils import *
 
 from .utils import preprocess_kg, create_split, process_disease_area_split, create_dgl_graph, evaluate_graph_construct, convert2str, data_download_wrapper
 
@@ -32,7 +33,7 @@ class TxData:
                      no_kg = False,
                      additional_train=None,
                      create_psuedo_edges=False,
-                     drop_dup_all=False):
+                     soft_pseudo=False):
         
         if split not in ['random', 'complex_disease', 'disease_eval', 'cell_proliferation', 'mental_health', 'cardiovascular', 'anemia', 'adrenal_gland', 'full_graph', 'downstream_pred']:
             raise ValueError("Please select one of the following supported splits: 'random', 'complex_disease', 'disease_eval', 'cell_proliferation', 'mental_health', 'cardiovascular', 'anemia', 'adrenal_gland'")
@@ -91,37 +92,81 @@ class TxData:
 
         ## I see duplicate rows? 
         df_train = df_train.drop_duplicates() ## To keep things the same.
-        if drop_dup_all:
-            df_valid = df_valid.drop_duplicates()       
-            df_test = df_test.drop_duplicates() 
+        # if drop_dup_all:
+        df_valid = df_valid.drop_duplicates()       
+        df_test = df_test.drop_duplicates() 
+    
+        if additional_train is not None:
+            ## creating rev relations
+            unique_rels = additional_train.relation.unique()
+            unique_rels_series = pd.Series(unique_rels)
+            print(f'psuedo df_train size before adding rev_ relations: {len(additional_train)}')
+            additional_train = reverse_rel_generation(None, additional_train, unique_rels_series, psuedo=True)
+            print(f'psuedo df_train size after adding rev_ relations: {len(additional_train)}')
 
-        # add additional training data (w/ self-supervised edges)
-        if additional_train is not None and create_psuedo_edges:
-            # ids = pd.concat([df_train[df_train.x_type == "drug"]['x_idx'], df_train[df_train.y_type == "drug"]['y_idx']]).unique()
-            # print(len(ids))
-            df_train = df_train.append(additional_train, ignore_index=True).drop_duplicates()
-            # ids = pd.concat([df_train[df_train.x_type == "drug"]['x_idx'], df_train[df_train.y_type == "drug"]['y_idx']]).unique()
-            # print(len(ids))
-
+            # insert pseudo data to create pseudo edges
+            if create_psuedo_edges:
+                print(f'total df train size before psuedo label injection: {len(df_train)}')
+                df_train = df_train.append(additional_train, ignore_index=True)
+                print(f'total df train size after psuedo label injection: {len(df_train)}')
+                
         print('Creating DGL graph....')
         # create dgl graph
-        g = create_dgl_graph(df_train, df) ## df is here to obtain the highest index number which is required to create a contiguous DGL graph
-        
+        self.G = create_dgl_graph(df_train, df) ## df is here to obtain the highest index number which is required to create a contiguous DGL graph
+
+        def construct_dd_only_graph(df_, soft_pseudo_logits=None): ## only to generate psuedo graphs
+            ## not generating off labels for dd_etypes
+            pseudo_dd_etypes = [('drug', 'contraindication', 'disease'), 
+                        ('drug', 'indication', 'disease'), 
+                        ('disease', 'rev_contraindication', 'drug'), 
+                        ('disease', 'rev_indication', 'drug'),] 
+            
+            # dd_etypes = [('drug', 'contraindication', 'disease'), 
+            #             ('drug', 'indication', 'disease'), 
+            #             ('drug', 'off-label use', 'disease'),
+            #             ('disease', 'rev_contraindication', 'drug'), 
+            #             ('disease', 'rev_indication', 'drug'), 
+            #             ('disease', 'rev_off-label use', 'drug')]
+            out = {}
+            # df_in = df_[['x_idx', 'relation', 'y_idx']]
+            df_in = df_
+            # for etype in g.canonical_etypes:
+            debug_sum = 0
+            for etype in pseudo_dd_etypes:
+                try:
+                    df_temp = df_in[df_in.relation == etype[1]]
+                except:
+                    print(etype[1])
+                src = df_temp.x_idx.astype(int).values
+                dst = df_temp.y_idx.astype(int).values
+                debug_sum += len(src)
+                out.update({etype: (src, dst)})
+                if soft_pseudo_logits is not None:
+                    soft_pseudo_logits.update({etype: torch.Tensor(df_temp['score'].values)})
+            print(f'total number of labels injected: {debug_sum}')
+            g = dgl.heterograph(out, num_nodes_dict = {ntype: self.G.number_of_nodes(ntype) for ntype in self.G.ntypes})
+            if soft_pseudo_logits is not None:
+                return g, soft_pseudo_logits 
+            else:
+                return g
         ## add additional training data (self-supervised data)
         if additional_train is not None and create_psuedo_edges is False:
-            ## create dictionaries with relation so that we could create a dgl.graph easily
-            rel_dict = {}
-            src = df[df.relation == 'contraindication'].y_idx.astype(int).values
-            dst = df[df.relation == 'contraindication'].x_idx.astype(int).values
-            src_ind = df[df.relation == 'indication'].y_idx.astype(int).values
-            dst_ind = df[df.relation == 'indication'].x_idx.astype(int).values
-            rel_dict.update({('disease', 'rev_contraindication', 'drug'): (src, dst)})
-            rel_dict.update({('disease', 'rev_indication', 'drug'): (src_ind, dst_ind)})
-            self.additional_train = rel_dict
-        else:
-            self.additional_train = None
+            ## new dgl to compute for 
+            if soft_pseudo:
+                # Set option to display all columns (None means no limit)
+                # pd.set_option('display.max_columns', None)
+                # print(additional_train.head(20))
+                # print(additional_train[additional_train['relation'] == 'rev_indication'].head(20))
 
-        self.G = g         
+                ## create labels for dgl graph
+                soft_pseudo_logits = {}
+                self.g_pos_pseudo, self.soft_psuedo_logits_rel = construct_dd_only_graph(additional_train, soft_pseudo_logits)
+            else:
+                self.soft_psuedo_logits_rel = None
+                self.g_pos_pseudo = construct_dd_only_graph(additional_train)
+        else:
+            self.g_pos_pseudo = None
+
         self.df, self.df_train, self.df_valid, self.df_test = df, df_train, df_valid, df_test
         self.disease_eval_idx = disease_eval_idx
         self.no_kg = no_kg

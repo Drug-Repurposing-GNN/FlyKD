@@ -16,6 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils import data
+import time
 
 from .model import *
 from .utils import *
@@ -47,9 +48,26 @@ class TxGNN:
         self.disease_eval_idx = data.disease_eval_idx
         self.split = data.split
         self.no_kg = data.no_kg
-        self.additional_train = data.additional_train
-        
+        self.g_pos_pseudo = data.g_pos_pseudo.to(device) if data.g_pos_pseudo is not None else None ## positive psuedo graph (ind, c-ind graph, w/ revs)
+        if data.soft_psuedo_logits_rel is not None:
+            ## move to cuda
+            soft_psuedo_logits_rel = {k: v.to(self.device) for k, v in data.soft_psuedo_logits_rel.items()}
+
+            ## sanity check for correspondence between labels and edges, you can compare with DistMult src, dst edges. 
+            # print(self.g_pos_pseudo.edges(etype='indication'))
+        else:
+            self.soft_psuedo_prob = None
+
+
         self.disease_rel_types = ['rev_contraindication', 'rev_indication', 'rev_off-label use']
+        
+        self.pseudo_dd_etypes = [('drug', 'contraindication', 'disease'), 
+                        ('drug', 'indication', 'disease'), 
+                        ('disease', 'rev_contraindication', 'drug'), 
+                        ('disease', 'rev_indication', 'drug'),]
+        ## compute and store pseudo probabilities to use as labels
+        soft_psuedo_logits = torch.cat([soft_psuedo_logits_rel[i] for i in self.pseudo_dd_etypes])
+        self.soft_psuedo_prob = torch.sigmoid(soft_psuedo_logits)
         
         self.dd_etypes = [('drug', 'contraindication', 'disease'), 
                   ('drug', 'indication', 'disease'), 
@@ -57,7 +75,7 @@ class TxGNN:
                   ('disease', 'rev_contraindication', 'drug'), 
                   ('disease', 'rev_indication', 'drug'), 
                   ('disease', 'rev_off-label use', 'drug')]
-        
+
         if self.weight_bias_track:
             import wandb
             wandb.init(project=proj_name, name=exp_name)  
@@ -225,34 +243,67 @@ class TxGNN:
         
         strt = time.time()
         for epoch in range(n_epoch):
+            if epoch == 0:
+                print("first epoch initiating")
             negative_graph = neg_sampler(self.G)
-            pred_score_pos, pred_score_neg, pos_score, neg_score, beta_kl_loss = self.model(self.G, negative_graph, pretrain_mode = False, mode = 'train')
+            # pred_score_pos, pred_score_neg, pos_score, neg_score, beta_kl_loss = self.model(self.G, negative_graph, pretrain_mode = False, mode = 'train')
+
+            ## extracting h to use in the following auxillary loss for psuedo labels
+            strt = time.time()
+            h, beta_kl_loss, distmult = self.model(self.G, negative_graph, pretrain_mode = False, mode = 'train', return_h_and_kl=True) 
+            pred_score_pos, _ = distmult(self.G, self.G, h, pretrain_mode=False, mode='train_pos') ## Mystery No.2, why did psuedo=True cause error? 
+            pred_score_neg, _ = distmult(negative_graph, self.G, h, pretrain_mode=False, mode='train_neg')
 
             pos_score = torch.cat([pred_score_pos[i] for i in self.dd_etypes])
             neg_score = torch.cat([pred_score_neg[i] for i in self.dd_etypes])
 
             scores = torch.sigmoid(torch.cat((pos_score, neg_score)).reshape(-1,))
+            # print(f'lenth of regular train: {len(scores)}')
             labels = [1] * len(pos_score) + [0] * len(neg_score)
             loss = F.binary_cross_entropy(scores, torch.Tensor(labels).float().to(self.device)) + beta_kl_loss
-            optimizer.zero_grad()
 
-            if self.additional_train is not None:
+            if self.g_pos_pseudo is not None:
                 ## second loss with psuedo labels
                 ## Things Omar could do:
                 ## Instead of just binary ones or zeros, need probabilities
                 ## Test out psuedo labels with negative sampling too. How does neg_sampler work?
-                g_psuedo_labels = dgl.heterograph(self.additional_train, num_nodes_dict = {ntype: self.G.number_of_nodes(ntype) for ntype in self.G.ntypes}, device=self.device)
-                ###
-                
-#                 scores = self.additional_train['score'].astype(float).to_numpy()
-#                 print('Shapes:' , psuedo_scores.shape, len(scores))
-#                 loss = loss + F.binary_cross_entropy(torch.sigmoid(psuedo_scores), scores)
-                
-                ###
-                _, psuedo_rel_scores, _, psuedo_scores, _ = self.model(self.G, g_psuedo_labels, psuedo=True)
-                loss = loss + F.binary_cross_entropy(torch.sigmoid(psuedo_scores), torch.ones(psuedo_scores.shape, device=self.device))
+                    ## Q. How are the pos_score computed not on the entire Graph but only between drug_disease relation? A. We compute all the prediction but index `dd_etypes` to get the drug disease relation scores only
+                    ## Q. How does the neg_sampling only create negative sampling between drug_disease relation? A. Same reason as above. 
+                ## we can collapse the below code with the above. 
+                # g_pos_psuedo = dgl.heterograph(self.additional_train, num_nodes_dict = {ntype: self.G.number_of_nodes(ntype) for ntype in self.G.ntypes}, device=self.device)
+                # g_pos_psuedo, g_neg_psuedo = evaluate_graph_construct(self.df_valid, self.G, 'fix_dst', 1, self.device)
+                # g_neg_pseudo = neg_sampler(self.g_pos_pseudo)
+                # psuedo_pos_scores_rel, psuedo_neg_scores_rel, _, _, beta_kl_loss = self.model(self.G, g_neg_psuedo, self.g_pos_psuedo, psuedo=True) 
+                pseudo_pos_scores_rel, _ = distmult(self.g_pos_pseudo, self.G, h, mode=None, pretrain_mode=False, pseudo_training=True)
+                # pseudo_neg_scores_rel, _ = distmult(g_neg_pseudo, self.G, h, mode=None, pretrain_mode=False, pseudo_training=True)
 
+                ## psuedo skips on off-label dd relation. 
+                pseudo_pos_scores = torch.cat([pseudo_pos_scores_rel[i] for i in self.pseudo_dd_etypes])
+                # pseudo_neg_scores = torch.cat([pseudo_neg_scores_rel[i] for i in self.pseudo_dd_etypes])
+
+                # pseudo_scores = torch.cat([pseudo_pos_scores, pseudo_neg_scores])
+                pseudo_scores = pseudo_pos_scores
+                ## Might not need negative labels because we have logits
+                # pseudo_labels = torch.cat([self.soft_psuedo_prob, torch.zeros(pseudo_neg_scores.shape, device=self.device)]) 
+                pseudo_labels = self.soft_psuedo_prob
+                ## Might want to use KL Divergence? 
+                normalized_pseudo_scores = F.log_softmax(pseudo_scores)
+                normalized_pseudo_labels = F.softmax(pseudo_labels)
+                pseudo_loss = F.kl_div(normalized_pseudo_scores, normalized_pseudo_labels) + beta_kl_loss
+                # pseudo_loss = F.binary_cross_entropy(torch.sigmoid(pseudo_scores), pseudo_labels) + beta_kl_loss
+                # psuedo_loss = F.binary_cross_entropy(torch.sigmoid(psuedo_neg_scores), torch.ones(psuedo_scores.shape, device=self.device))
+
+                print(f"loss: {loss}")
+                print(f"pseudo loss: {pseudo_loss}")
+                print(f"beta kl loss: {beta_kl_loss}")
+                
+                loss = (loss + pseudo_loss) / 2 ## can try adjusting loss with weighted parameters...
+                # loss = psuedo_loss
+            print(f'Epoch Training time: {time.time() - strt}')
+                
+            optimizer.zero_grad()
             loss.backward()
+            # print(f"printing model's gradients: {[p.grad for p in self.model.parameters()]}")
             optimizer.step()
             scheduler.step(loss)
 
@@ -330,9 +381,6 @@ class TxGNN:
                                   })
 
                     self.wandb.log(temp_d)
-
-                print(time.time() - strt)
-                strt = time.time()
 
         print('Testing...')
         self.model.eval()

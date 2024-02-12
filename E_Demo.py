@@ -2,19 +2,30 @@ from txgnn import TxData, TxGNN, TxEval
 import time
 import argparse
 import pandas as pd
+from accelerate.utils import set_seed
+
+
 parser = argparse.ArgumentParser()
-parser.add_argument("--drop_dup", action="store_true")
+# parser.add_argument("--drop_dup", action="store_true")
 parser.add_argument("--size", default=100, type=int)
+parser.add_argument("--seed", default=1, type=int)
+parser.add_argument("--psuedo", action="store_true")
 # parser.add_argument("dropout", default=0)
 args = parser.parse_args()
 
+seed = args.seed
+set_seed(seed)
 strt = time.time()
 saving_path = './pre_trained_model_ckpt/'
 # split = 'cell_proliferation'
 
 TxData = TxData(data_folder_path = './data/')
-TxData.prepare_split(split = 'complex_disease', seed = 1, no_kg = False, additional_train = pd.read_csv('psuedo_labels_15000.csv'))
-# TxData.prepare_split(split=split, seed = 42, no_kg = False)
+split = 'complex_disease'
+
+if args.psuedo:
+    TxData.prepare_split(split=split, seed = seed, no_kg = False, additional_train = pd.read_csv('psuedo_labels_75000.csv'))
+else:
+    TxData.prepare_split(split=split, seed = seed, no_kg = False)
 
 txGNN = TxGNN(
         data = TxData, 
@@ -41,11 +52,11 @@ txGNN.model_initialize(n_hid = size,
                       walk_mode = 'bit',
                       path_length = 2)
 
-# ## here we did not run this, since the output is too long to fit into the notebook
-# txGNN.pretrain(n_epoch = 1, ## was 2
-#                learning_rate = 1e-3,
-#                batch_size = 1024, 
-#                train_print_per_n = 20)
+## here we did not run this, since the output is too long to fit into the notebook
+txGNN.pretrain(n_epoch = 1, ## was 2
+               learning_rate = 1e-3,
+               batch_size = 1024, 
+               train_print_per_n = 20)
 
 # here as a demo, the n_epoch is set to 30. Change it to n_epoch = 500 when you use it
 txGNN.finetune(n_epoch = 500,  ## could be set to 30 for speed
@@ -54,8 +65,7 @@ txGNN.finetune(n_epoch = 500,  ## could be set to 30 for speed
                valid_per_n = 20)
 
 # # TxGNN.save_model('./model_ckpt')
-# TxGNN.save_model(saving_path+split)
-# TxGNN.save_model(saving_path + 'mlp_1/')
+txGNN.save_model(f'{saving_path}seed_{seed}_normal')
 print("Done training")
 end = time.time()
 print(end - strt)

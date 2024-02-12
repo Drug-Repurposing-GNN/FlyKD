@@ -117,7 +117,8 @@ class DistMultPredictor(nn.Module):
         score = torch.sum(h_u * h_r * h_v, dim=1)
         return {'score': score}
 
-    def forward(self, graph, G, h, pretrain_mode, mode, block = None, only_relation = None, psuedo=False):
+    ## pseudo_training disabled dpm
+    def forward(self, graph, G, h, pretrain_mode, mode, block = None, only_relation = None, pseudo_training=False):
         with graph.local_scope():
             scores = {}
             s_l = []
@@ -127,9 +128,9 @@ class DistMultPredictor(nn.Module):
             else:
                 etypes_train = self.etypes_dd
             
-            if psuedo:
-                etypes_train = graph.canonical_etypes
-            elif only_relation is not None:
+            if pseudo_training:
+                etypes_train = graph.canonical_etypes ## if you are going to use psuedo labels and skip (off-label relations)
+            if only_relation is not None:
                 if only_relation == 'indication':
                     etypes_train = [('drug', 'indication', 'disease'),
                                     ('disease', 'rev_indication', 'drug')]
@@ -157,7 +158,7 @@ class DistMultPredictor(nn.Module):
                 
                 for etype in etypes_train:
 
-                    if self.proto:
+                    if not pseudo_training and self.proto:
                         src, dst = etype[0], etype[2]
                         src_rel_idx = torch.where(graph.out_degrees(etype=etype) != 0)
                         dst_rel_idx = torch.where(graph.in_degrees(etype=etype) != 0)
@@ -270,18 +271,17 @@ class DistMultPredictor(nn.Module):
 
                         graph.ndata['h'] = h
 
-                    graph.apply_edges(self.apply_edges, etype=etype)    
+                    graph.apply_edges(self.apply_edges, etype=etype)  
                     out = graph.edges[etype].data['score']
                     s_l.append(out)
                     scores[etype] = out
 
-                    if self.proto:
+                    if not pseudo_training and self.proto:
                         # recover back to the original embeddings for other relations
                         h[src][src_rel_idx] = src_h
                         h[dst][dst_rel_idx] = dst_h
                 
-                
-            if pretrain_mode or psuedo:
+            if pretrain_mode or pseudo_training:
                 s_l = torch.cat(s_l)             
             else: 
                 s_l = torch.cat(s_l).reshape(-1,).detach().cpu().numpy()
@@ -556,7 +556,7 @@ class HeteroRGCN(nn.Module):
         return scores, scores_neg, out_pos, out_neg, beta_kl_loss
         
     
-    def forward(self, G, neg_G, eval_pos_G = None, return_h = False, return_att = False, mode = 'train', pretrain_mode = False, psuedo=False):
+    def forward(self, G, neg_G, eval_pos_G = None, return_h = False, return_att = False, mode = 'train', pretrain_mode = False, pseudo_training=False, return_h_and_kl=False):
         with G.local_scope():
             input_dict = {ntype : G.nodes[ntype].data['inp'] for ntype in G.ntypes}
 
@@ -594,6 +594,9 @@ class HeteroRGCN(nn.Module):
                     
             if return_h:
                 return h
+            
+            if return_h_and_kl:
+                return h, beta_kl_loss, self.pred
 
             if return_att:
                 return a_dict_l1, a_dict_l2
@@ -601,15 +604,16 @@ class HeteroRGCN(nn.Module):
             # full batch
             if eval_pos_G is not None:
                 # eval mode
-                scores, out_pos = self.pred(eval_pos_G, G, h, pretrain_mode, mode = mode + '_pos')
-                scores_neg, out_neg = self.pred(neg_G, G, h, pretrain_mode, mode = mode + '_neg')
+                scores, out_pos = self.pred(eval_pos_G, G, h, pretrain_mode, mode = mode + '_pos', pseudo_training=pseudo_training)
+                scores_neg, out_neg = self.pred(neg_G, G, h, pretrain_mode, mode = mode + '_neg', pseudo_training=pseudo_training)
                 return scores, scores_neg, out_pos, out_neg, beta_kl_loss
-            elif psuedo: ## useful for only producing the relation score on neg_G
-                scores_neg, out_neg = self.pred(neg_G, G, h, pretrain_mode, mode = mode + '_neg', psuedo=True)
-                return None, scores_neg, None, out_neg, 0
+            # elif psuedo: ## useful for only producing the relation score on neg_G (but doesn't necessarily have to be neg G)
+            #     scores, out_pos = self.pred(G, G, h, pretrain_mode, mode = mode + '_pos')
+            #     scores_neg, out_neg = self.pred(neg_G, G, h, pretrain_mode, mode = mode + '_neg', psuedo=True)
+            #     return scores, scores_neg, out_pos, out_neg, beta_kl_loss
             else:
-                scores, out_pos = self.pred(G, G, h, pretrain_mode, mode = mode + '_pos')
-                scores_neg, out_neg = self.pred(neg_G, G, h, pretrain_mode, mode = mode + '_neg')
+                scores, out_pos = self.pred(G, G, h, pretrain_mode, mode = mode + '_pos', pseudo_training=pseudo_training)
+                scores_neg, out_neg = self.pred(neg_G, G, h, pretrain_mode, mode = mode + '_neg', pseudo_training=pseudo_training)
                 return scores, scores_neg, out_pos, out_neg, beta_kl_loss
     
     def graphmask_forward(self, G, pos_graph, neg_graph, graphmask_mode = False, return_gates = False, only_relation = None):
