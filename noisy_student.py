@@ -260,7 +260,6 @@ if __name__ == '__main__':
         psuedo_labels = generate_psuedo_labels(pre_trained_dir='pre_trained_model_ckpt/seed_1_normal', split=args.split, size=100, seed=seed, deg=args.deg, k_top_candidates=args.k_top_candidates, least_score=args.least_score)
         psuedo_labels.to_csv(args.psuedo_label_fname, index=False)
 
-###
 
 def generate_n_psuedo_labels(n=5, pre_trained_dir='pre_trained_model_ckpt/1', split='complex_disease', size=100, seed=1, deg=1, k_top_candidates=5, least_score=None):
     '''

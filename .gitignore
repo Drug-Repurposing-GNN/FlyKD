@@ -9,10 +9,12 @@ __pycache__/
 ## csv or pkl
 *.csv
 *.pkl
+*.pt
 *.txt
 *.out
 
 # Distribution / packaging
+wandb/
 .Python
 build/
 develop-eggs/
