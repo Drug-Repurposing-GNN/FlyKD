@@ -12,6 +12,7 @@ __pycache__/
 *.pt
 *.txt
 *.out
+*.pth
 
 # Distribution / packaging
 wandb/

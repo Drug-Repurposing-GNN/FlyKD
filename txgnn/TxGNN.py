@@ -39,7 +39,9 @@ class TxGNN:
                        weight_bias_track = False,
                        proj_name = 'TxGNN',
                        exp_name = 'TxGNN',
-                       device = 'cuda'):
+                       device = 'cuda',
+                       use_og = False,
+                       T = 1):
         self.device = torch.device(device)
         self.weight_bias_track = weight_bias_track
         self.G = data.G
@@ -48,33 +50,38 @@ class TxGNN:
         self.disease_eval_idx = data.disease_eval_idx
         self.split = data.split
         self.no_kg = data.no_kg
+        # self.kg_all = data.kg_all.to(device)
+        # self.kg_nc = data.kg_nc.to(device)
         self.g_pos_pseudo = data.g_pos_pseudo.to(device) if data.g_pos_pseudo is not None else None ## positive psuedo graph (ind, c-ind graph, w/ revs)
+        self.g_pos_dd = data.g_pos_dd
+        self.pseudo_dd_etypes = [('drug', 'contraindication', 'disease'), 
+                                ('drug', 'indication', 'disease'), ]
+                                # ('disease', 'rev_contraindication', 'drug'), 
+                                # ('disease', 'rev_indication', 'drug'),]
+        self.T = T
+        self.seed = data.seed
+        self.use_og = use_og
         if data.soft_psuedo_logits_rel is not None:
             ## move to cuda
             soft_psuedo_logits_rel = {k: v.to(self.device) for k, v in data.soft_psuedo_logits_rel.items()}
+            ## compute and store pseudo probabilities to use as labels
+            soft_psuedo_logits = torch.cat([soft_psuedo_logits_rel[i] for i in self.pseudo_dd_etypes])
+            self.soft_psuedo_prob = torch.sigmoid(soft_psuedo_logits / T)
 
             ## sanity check for correspondence between labels and edges, you can compare with DistMult src, dst edges. 
             # print(self.g_pos_pseudo.edges(etype='indication'))
         else:
             self.soft_psuedo_prob = None
 
-
         self.disease_rel_types = ['rev_contraindication', 'rev_indication', 'rev_off-label use']
         
-        self.pseudo_dd_etypes = [('drug', 'contraindication', 'disease'), 
-                        ('drug', 'indication', 'disease'), 
-                        ('disease', 'rev_contraindication', 'drug'), 
-                        ('disease', 'rev_indication', 'drug'),]
-        ## compute and store pseudo probabilities to use as labels
-        soft_psuedo_logits = torch.cat([soft_psuedo_logits_rel[i] for i in self.pseudo_dd_etypes])
-        self.soft_psuedo_prob = torch.sigmoid(soft_psuedo_logits)
-        
         self.dd_etypes = [('drug', 'contraindication', 'disease'), 
-                  ('drug', 'indication', 'disease'), 
-                  ('drug', 'off-label use', 'disease'),
-                  ('disease', 'rev_contraindication', 'drug'), 
-                  ('disease', 'rev_indication', 'drug'), 
-                  ('disease', 'rev_off-label use', 'drug')]
+                        ('drug', 'indication', 'disease'), 
+                        ]
+                    #   ('drug', 'off-label use', 'disease'),
+                    #   ('disease', 'rev_contraindication', 'drug'), 
+                    #   ('disease', 'rev_indication', 'drug'), 
+                    #   ('disease', 'rev_off-label use', 'drug')]
 
         if self.weight_bias_track:
             import wandb
@@ -98,52 +105,96 @@ class TxGNN:
                                walk_mode = 'bit',
                                path_length = 2,
                                dropout = False,
-                               reparam_mode=False):
+                               reparam_mode=False,
+                               kl = False,
+                               debug = False,
+                               neg_pseudo_sampling = False,
+                               LSP = False,
+                               LSP_size="full",):
         
         if self.no_kg and proto:
             print('Ablation study on No-KG. No proto learning is used...')
             proto = False
-        
+        self.neg_pseudo_sampling = neg_pseudo_sampling
+        self.kl = kl
+        self.LSP = LSP
+        self.LS_target = None
+        if LSP is not None:
+            self.LSP = LSP
+            self.LSP_size = LSP_size
+
+            if LSP == "cosine":
+                if LSP_size=="full" :
+                    self.LS_target = torch.load("LSP_full_cosine.pt")
+                elif LSP_size=="partial":
+                    self.LS_target = torch.load("LSP_partial_cosine.pt")
+                else:
+                    raise KeyError
+            elif LSP == "L2":
+                if LSP_size=="full" :
+                    self.LS_target = torch.load("LSP_full_L2.pt")
+                elif LSP_size=="partial":
+                    self.LS_target = torch.load("LSP_partial_L2.pt")
+                else:
+                    raise KeyError
+            elif LSP == "Poly":
+                raise KeyError ## not available yet
+                if LSP_size=="full" :
+                    self.LS_target = torch.load("LSP_full_L2.pt")
+                elif LSP_size=="partial":
+                    self.LS_target = torch.load("LSP_partial_L2.pt")
+                else:
+                    raise KeyError
+            elif LSP == "RBF":
+                if LSP_size=="full" :
+                    self.LS_target = torch.load("LSP_full_RBF.pt")
+                elif LSP_size=="partial":
+                    self.LS_target = torch.load("LSP_partial_RBF.pt")
+                else:
+                    raise KeyError
+
         self.G = self.G.to('cpu')
         self.G = initialize_node_embedding(self.G, n_inp)
         self.g_valid_pos, self.g_valid_neg = evaluate_graph_construct(self.df_valid, self.G, 'fix_dst', 1, self.device)
         self.g_test_pos, self.g_test_neg = evaluate_graph_construct(self.df_test, self.G, 'fix_dst', 1, self.device)
 
         self.config = {'n_hid': n_hid, 
-                       'n_inp': n_inp, 
-                       'n_out': n_out, 
-                       'proto': proto,
-                       'proto_num': proto_num,
-                       'attention': attention,
-                       'sim_measure': sim_measure,
-                       'bert_measure': bert_measure,
-                       'agg_measure': agg_measure,
-                       'num_walks': num_walks,
-                       'walk_mode': walk_mode,
-                       'path_length': path_length
-                      }
-
+                    'n_inp': n_inp, 
+                    'n_out': n_out, 
+                    'proto': proto,
+                    'proto_num': proto_num,
+                    'attention': attention,
+                    'sim_measure': sim_measure,
+                    'bert_measure': bert_measure,
+                    'agg_measure': agg_measure,
+                    'num_walks': num_walks,
+                    'walk_mode': walk_mode,
+                    'path_length': path_length
+                    }
         self.model = HeteroRGCN(self.G,
-                   in_size=n_inp,
-                   hidden_size=n_hid,
-                   out_size=n_out,
-                   attention = attention,
-                   proto = proto,
-                   proto_num = proto_num,
-                   sim_measure = sim_measure,
-                   bert_measure = bert_measure, 
-                   agg_measure = agg_measure,
-                   num_walks = num_walks,
-                   walk_mode = walk_mode,
-                   path_length = path_length,
-                   split = self.split,
-                   data_folder = self.data_folder,
-                   exp_lambda = exp_lambda,
-                   device = self.device,
-                   dropout=dropout,
-                   reparam_mode=reparam_mode,
-                  ).to(self.device)    
+        # self.model = HeteroRGCN(self.kg_nc, #### TESTING #### Would this speed unseen DPM much faster without compromising performance?
+                in_size=n_inp,
+                hidden_size=n_hid,
+                out_size=n_out,
+                attention = attention,
+                proto = proto,
+                proto_num = proto_num,
+                sim_measure = sim_measure,
+                bert_measure = bert_measure, 
+                agg_measure = agg_measure,
+                num_walks = num_walks,
+                walk_mode = walk_mode,
+                path_length = path_length,
+                split = self.split,
+                data_folder = self.data_folder,
+                exp_lambda = exp_lambda,
+                device = self.device,
+                dropout=dropout,
+                reparam_mode=reparam_mode,
+                seed = self.seed,
+                ).to(self.device)    
         self.best_model = self.model
+        self.best_G = self.G ## to store best validation's Graph Embedding
         
     def pretrain(self, n_epoch = 1, learning_rate = 1e-3, batch_size = 1024, train_print_per_n = 20, sweep_wandb = None):
         
@@ -230,16 +281,22 @@ class TxGNN:
                        valid_per_n = 25,
                        sweep_wandb = None,
                        save_name = None,
-                       weight_decay = 0):
+                       weight_decay = 0,
+                       no_dpm = False):
         
         best_val_acc = 0
 
         self.G = self.G.to(self.device)
-        neg_sampler = Full_Graph_NegSampler(self.G, 1, 'fix_dst', self.device)
+        
+        # neg_sampler = Full_Graph_NegSampler(self.G, 1, 'fix_dst', self.device)
+        neg_sampler = Full_Graph_NegSampler(self.g_pos_dd, 1, 'fix_dst', self.device)
+        if self.g_pos_pseudo is not None:
+            # pseudo_neg_sampler = Full_Graph_NegSampler(self.g_pos_pseudo, 1, 'fix_dst', self.device)
+            pseudo_neg_sampler = Full_Graph_NegSampler(self.g_pos_dd, 1, 'fix_dst', self.device)
         torch.nn.init.xavier_uniform(self.model.w_rels) # reinitialize decoder
         
         optimizer = torch.optim.AdamW(self.model.parameters(), lr = learning_rate, weight_decay=weight_decay)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', 0.8)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', 0.95)
         
         strt = time.time()
         for epoch in range(n_epoch):
@@ -262,6 +319,57 @@ class TxGNN:
             labels = [1] * len(pos_score) + [0] * len(neg_score)
             loss = F.binary_cross_entropy(scores, torch.Tensor(labels).float().to(self.device)) + beta_kl_loss
 
+            LSP_loss = 0
+            if self.LS_target is not None:
+                ## kg_all is used to compute the LS vector of all label pairs but only using the train split to compute the LS vector
+                #### TODO #### Change kg_all to G and allow all computation on all disease node's neighbor somehow
+                _, _, LS_pred = distmult(self.G, self.G, h, mode=None, pretrain_mode=False, LSP=self.LSP, LSP_size=self.LSP_size)
+
+                # for i, (LS_i, LS_target_i) in enumerate(zip(LS_pred, self.LS_target)):
+                LSP_strt = time.time()
+                for LS_i, LS_target_i in zip(LS_pred, self.LS_target):
+                    # LS_target_i = LS_target_i.coalesce()
+                    # LS_i, LS_target_i = LS_i.coalesce(), LS_target_i.coalesce()
+                    if len(LS_i) > 0:
+                    # if len(LS_i.values()) > 0:
+                        ## softmax LS_i
+                        pred_prob = F.softmax(LS_i)
+                        # target_prob = LS_target_i.values() 
+                        ## compute loss
+                        LSP_loss += F.kl_div(pred_prob.log(), LS_target_i) ## pre-softmaxed target prob
+
+                # for (k,v), (k_pred,v_pred) in zip(self.LS_target.items(), enumerate(LS_pred)):
+                #     #### TODO #### we can try a kernel trick to comptue LS and also between LS if you wish?
+                #     if len(v) > 0:
+                #         v_pred = torch.sigmoid(v_pred)
+                #         v_pred = torch.clamp(v_pred, min=1e-9)
+                #         v_pred = v_pred / v_pred.sum()
+                #         log_v_pred = v_pred.log()
+
+                #         # print(v_pred)
+                #         # print(v)
+                #         # print(torch.isinf(v).any())
+                #         # print(torch.isinf(log_v_pred).any())
+                #         # print(torch.isnan(v).any())
+                #         # print(torch.isnan(log_v_pred).any())
+                #         # print(torch.isnan(v.log()).any())
+                #         # print(torch.isinf(v.log()).any())
+
+                #         LSP_loss = LSP_loss + F.kl_div(log_v_pred, v)
+                        
+                ## Lambda is incorporated below
+                LSP_loss = 100 * LSP_loss / len(LS_pred)
+                print(LSP_loss)
+                # print(v_pred)
+                # print(v)
+                # print(LSP_loss)
+                if self.g_pos_pseudo is None:
+                    if self.use_og:
+                        loss = loss + LSP_loss
+                    else:
+                        loss = LSP_loss
+                print(f"LSP loss computation time taken: {time.time() - LSP_strt}")
+
             if self.g_pos_pseudo is not None:
                 ## second loss with psuedo labels
                 ## Things Omar could do:
@@ -272,40 +380,65 @@ class TxGNN:
                 ## we can collapse the below code with the above. 
                 # g_pos_psuedo = dgl.heterograph(self.additional_train, num_nodes_dict = {ntype: self.G.number_of_nodes(ntype) for ntype in self.G.ntypes}, device=self.device)
                 # g_pos_psuedo, g_neg_psuedo = evaluate_graph_construct(self.df_valid, self.G, 'fix_dst', 1, self.device)
-                # g_neg_pseudo = neg_sampler(self.g_pos_pseudo)
-                # psuedo_pos_scores_rel, psuedo_neg_scores_rel, _, _, beta_kl_loss = self.model(self.G, g_neg_psuedo, self.g_pos_psuedo, psuedo=True) 
+
+                # psuedo_pos_scores_rel, psuedo_neg_scores_rel, _, _, beta_kl_loss = self.model(self.G, g_neg_psuedo, self.g_pos_psuedo, psuedo=True)
+
+                print("calling positive graph for pseudo")
                 pseudo_pos_scores_rel, _ = distmult(self.g_pos_pseudo, self.G, h, mode=None, pretrain_mode=False, pseudo_training=True)
-                # pseudo_neg_scores_rel, _ = distmult(g_neg_pseudo, self.G, h, mode=None, pretrain_mode=False, pseudo_training=True)
 
                 ## psuedo skips on off-label dd relation. 
                 pseudo_pos_scores = torch.cat([pseudo_pos_scores_rel[i] for i in self.pseudo_dd_etypes])
-                # pseudo_neg_scores = torch.cat([pseudo_neg_scores_rel[i] for i in self.pseudo_dd_etypes])
-
-                # pseudo_scores = torch.cat([pseudo_pos_scores, pseudo_neg_scores])
-                pseudo_scores = pseudo_pos_scores
+                if self.neg_pseudo_sampling:
+                    # g_neg_pseudo = pseudo_neg_sampler(self.g_pos_pseudo) 
+                    g_neg_pseudo = pseudo_neg_sampler(self.g_pos_dd) 
+                    print("calling negative graph for pseudo")
+                    pseudo_neg_scores_rel, _ = distmult(g_neg_pseudo, self.G, h, mode=None, pretrain_mode=False, pseudo_training=True)
+                    pseudo_neg_scores = torch.cat([pseudo_neg_scores_rel[i] for i in self.pseudo_dd_etypes])
+                    pseudo_labels = torch.cat([self.soft_psuedo_prob, torch.zeros(pseudo_neg_scores.shape, device=self.device)]) 
+                    pseudo_scores = torch.cat([pseudo_pos_scores, pseudo_neg_scores])
+                else:
+                    pseudo_scores = pseudo_pos_scores
+                    pseudo_labels = self.soft_psuedo_prob
                 ## Might not need negative labels because we have logits
-                # pseudo_labels = torch.cat([self.soft_psuedo_prob, torch.zeros(pseudo_neg_scores.shape, device=self.device)]) 
-                pseudo_labels = self.soft_psuedo_prob
                 ## Might want to use KL Divergence? 
-                normalized_pseudo_scores = F.log_softmax(pseudo_scores)
-                normalized_pseudo_labels = F.softmax(pseudo_labels)
-                pseudo_loss = F.kl_div(normalized_pseudo_scores, normalized_pseudo_labels) + beta_kl_loss
-                # pseudo_loss = F.binary_cross_entropy(torch.sigmoid(pseudo_scores), pseudo_labels) + beta_kl_loss
+                # eps = 1e-12
+                # pseudo_loss = pseudo_labels * (torch.log(pseudo_labels + eps) - F.logsigmoid(pseudo_scores)) + \
+                #             (1 - pseudo_labels) * (torch.log(1 - pseudo_labels + eps) - torch.log(1 - torch.sigmoid(pseudo_scores) + eps))
+                # pseudo_loss = pseudo_loss.mean()
+                if self.kl:
+                    print("using kl")
+                    pseudo_labels = pseudo_labels.unsqueeze(dim=1)
+                    pseudo_scores = F.sigmoid(pseudo_scores.unsqueeze(dim=1))
+                    pseudo_labels_dist = torch.cat([1 - pseudo_labels, pseudo_labels], dim=1) # torch.Size([1366400, 2])
+                    pseudo_scores_dist = torch.cat([1 - pseudo_scores, pseudo_scores], dim=1) # torch.Size([1366400, 2])
+                    pseudo_loss = F.kl_div(torch.log(pseudo_scores_dist), pseudo_labels_dist) + beta_kl_loss
+                else:
+                    print("using CE")
+                    pseudo_loss = F.binary_cross_entropy(torch.sigmoid(pseudo_scores), pseudo_labels) + beta_kl_loss
                 # psuedo_loss = F.binary_cross_entropy(torch.sigmoid(psuedo_neg_scores), torch.ones(psuedo_scores.shape, device=self.device))
 
                 print(f"loss: {loss}")
                 print(f"pseudo loss: {pseudo_loss}")
+                print(f'pseudo_scores: {pseudo_scores[0], pseudo_labels[0]}')
                 print(f"beta kl loss: {beta_kl_loss}")
                 
-                loss = (loss + pseudo_loss) / 2 ## can try adjusting loss with weighted parameters...
-                # loss = psuedo_loss
-            print(f'Epoch Training time: {time.time() - strt}')
-                
+                if self.use_og:
+                    loss = 0.05 * loss + pseudo_loss ## can try adjusting loss with weighted parameters...
+                else:
+                    loss = pseudo_loss
+                if self.LSP:
+                    loss = loss + LSP_loss
+            
+
+            # torch.autograd.set_detect_anomaly(True)
             optimizer.zero_grad()
-            loss.backward()
+            with torch.autograd.set_detect_anomaly(True):
+                loss.backward()
             # print(f"printing model's gradients: {[p.grad for p in self.model.parameters()]}")
             optimizer.step()
             scheduler.step(loss)
+            end = time.time()
+            print(f'Epoch Training time: {end - strt}')
 
             if self.weight_bias_track:
                 self.wandb.log({"Training Loss": loss})
@@ -337,16 +470,21 @@ class TxGNN:
 
             del pred_score_pos, pred_score_neg, scores, labels
 
-            if (epoch) % valid_per_n == 0:
+            if (epoch) % valid_per_n == 0 or epoch == n_epoch-1:
                 # validation tracking...
                 print('Validation.....')
                 self.model.eval()
                 (auroc_rel, auprc_rel, micro_auroc, micro_auprc, macro_auroc, macro_auprc), loss = evaluate_fb(self.model, self.g_valid_pos, self.g_valid_neg, self.G, self.dd_etypes, self.device, mode = 'valid')
                 self.model.train()
 
-                if best_val_acc < macro_auroc:
+                strt = time.time()
+                ## Now way <400 epoch does the best.
+                if epoch == n_epoch-1: ## Just storing the last because of some 'killed' error
+                # if best_val_acc < macro_auroc and epoch > int(0.8 * n_epoch): 
                     best_val_acc = macro_auroc
                     self.best_model = copy.deepcopy(self.model)
+                    self.best_G = copy.deepcopy(self.G)
+                print(f"time it took to deep copy the model and graph: {time.time() - strt}")
 
                 print('Epoch: %d LR: %.5f Validation Loss %.4f,  Validation Micro AUROC %.4f Validation Micro AUPRC %.4f Validation Macro AUROC %.4f Validation Macro AUPRC %.4f (Best Macro AUROC %.4f)' % (
                     epoch,
@@ -381,10 +519,11 @@ class TxGNN:
                                   })
 
                     self.wandb.log(temp_d)
+                print(f'Validation Epoch time: {time.time() - end}')
 
         print('Testing...')
         self.model.eval()
-        (auroc_rel, auprc_rel, micro_auroc, micro_auprc, macro_auroc, macro_auprc), loss, pred_pos, pred_neg = evaluate_fb(self.best_model, self.g_test_pos, self.g_test_neg, self.G, self.dd_etypes, self.device, True, mode = 'test')
+        (auroc_rel, auprc_rel, micro_auroc, micro_auprc, macro_auroc, macro_auprc), loss, pred_pos, pred_neg = evaluate_fb(self.best_model, self.g_test_pos, self.g_test_neg, self.best_G, self.dd_etypes, self.device, True, mode = 'test')
 
         print('Testing Loss %.4f Testing Micro AUROC %.4f Testing Micro AUPRC %.4f Testing Macro AUROC %.4f Testing Macro AUPRC %.4f' % (
             loss,
@@ -426,6 +565,17 @@ class TxGNN:
         with open(os.path.join(path, 'config.pkl'), 'wb') as f:
             pickle.dump(self.config, f)
        
+        embeddings = {}
+        for ntype in self.best_G.ntypes:
+            embeddings[ntype] = self.G.nodes[ntype].data['inp']
+            # print(self.G.nodes)
+            # print(self.G.nodes[ntype])
+            # print(self.G.nodes[ntype].data['inp'])
+        torch.save(embeddings, os.path.join(path, 'best_G.pt'))
+        torch.save(self.g_valid_pos, os.path.join(path, 'g_valid_pos.pt'))
+        torch.save(self.g_valid_neg, os.path.join(path, 'g_valid_neg.pt'))
+        torch.save(self.g_test_pos, os.path.join(path, 'g_test_pos.pt'))
+        torch.save(self.g_test_neg, os.path.join(path, 'g_test_neg.pt'))
         torch.save(self.best_model.state_dict(), os.path.join(path, 'model.pt'))
         #save_graphs(os.path.join(path, 'graph_dgl.bin', [self.G]))
     
@@ -530,29 +680,45 @@ class TxGNN:
                       
         return similar_diseases
                       
-    def load_pretrained(self, path):
+    def load_pretrained(self, path, legacy=False, super_legacy=False):
         ## load config file
         
         with open(os.path.join(path, 'config.pkl'), 'rb') as f:
             config = pickle.load(f)
             
-        self.model_initialize(**config)
+        self.model_initialize(**config, debug=True)
         self.config = config
-        #self.G = initialize_node_embedding(self.G, config['n_inp'])
+        # self.G = initialize_node_embedding(self.G.to(torch.device("cpu")), config['n_inp']).to(self.device)
         
         state_dict = torch.load(os.path.join(path, 'model.pt'), map_location = torch.device('cpu'))
-        if next(iter(state_dict))[:7] == 'module.':
-            # the pretrained model is from data-parallel module
-            from collections import OrderedDict
-            new_state_dict = OrderedDict()
-            for k, v in state_dict.items():
-                name = k[7:] # remove `module.`
-                new_state_dict[name] = v
-            state_dict = new_state_dict
-        
+        if legacy: 
+            state_dict_G = torch.load(os.path.join(path, 'G.pt'), map_location = torch.device('cpu'))
+        else:
+            state_dict_G = torch.load(os.path.join(path, 'best_G.pt'), map_location = torch.device('cpu'))
+            # if next(iter(state_dict))[:7] == 'module.':
+            #     # the pretrained model is from data-parallel module
+            #     from collections import OrderedDict
+            #     new_state_dict = OrderedDict()
+            #     for k, v in state_dict.items():
+            #         name = k[7:] # remove `module.`
+            #         new_state_dict[name] = v
+            #     state_dict = new_state_dict
+        if not super_legacy:
+            self.g_valid_pos = torch.load(os.path.join(path, 'g_valid_pos.pt'))
+            self.g_valid_neg = torch.load(os.path.join(path, 'g_valid_neg.pt'))
+            self.g_test_pos = torch.load(os.path.join(path, 'g_test_pos.pt'))
+            self.g_test_neg = torch.load(os.path.join(path, 'g_test_neg.pt'))
         self.model.load_state_dict(state_dict)
+        for ntype, embs in state_dict_G.items():
+            self.G.nodes[ntype].data['inp'] = embs
+            if not legacy:
+                self.best_G.nodes[ntype].data['inp'] = embs
+
         self.model = self.model.to(self.device)
+        self.G = self.G.to(self.device)
+        self.best_G = self.best_G.to(self.device)
         self.best_model = self.model
+        print(f"Checkpoint loaded from path: {path}")
         
     def train_graphmask(self, relation = 'indication',
                               learning_rate = 3e-4,

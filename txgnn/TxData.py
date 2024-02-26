@@ -98,10 +98,11 @@ class TxData:
     
         if additional_train is not None:
             ## creating rev relations
-            unique_rels = additional_train.relation.unique()
-            unique_rels_series = pd.Series(unique_rels)
+            # additional_train = pd.read_csv(additional_train)
+            # unique_rels = additional_train.relation.unique()
+            # unique_rels_series = pd.Series(unique_rels)
             print(f'psuedo df_train size before adding rev_ relations: {len(additional_train)}')
-            additional_train = reverse_rel_generation(None, additional_train, unique_rels_series, psuedo=True)
+            # additional_train = reverse_rel_generation(None, additional_train, unique_rels_series, psuedo=True)
             print(f'psuedo df_train size after adding rev_ relations: {len(additional_train)}')
 
             # insert pseudo data to create pseudo edges
@@ -118,8 +119,9 @@ class TxData:
             ## not generating off labels for dd_etypes
             pseudo_dd_etypes = [('drug', 'contraindication', 'disease'), 
                         ('drug', 'indication', 'disease'), 
-                        ('disease', 'rev_contraindication', 'drug'), 
-                        ('disease', 'rev_indication', 'drug'),] 
+                        # ('disease', 'rev_contraindication', 'drug'), 
+                        # ('disease', 'rev_indication', 'drug'),
+                        ] 
             
             # dd_etypes = [('drug', 'contraindication', 'disease'), 
             #             ('drug', 'indication', 'disease'), 
@@ -150,6 +152,8 @@ class TxData:
             else:
                 return g
         ## add additional training data (self-supervised data)
+        self.soft_psuedo_logits_rel = None
+        self.g_pos_pseudo = None
         if additional_train is not None and create_psuedo_edges is False:
             ## new dgl to compute for 
             if soft_pseudo:
@@ -162,12 +166,12 @@ class TxData:
                 soft_pseudo_logits = {}
                 self.g_pos_pseudo, self.soft_psuedo_logits_rel = construct_dd_only_graph(additional_train, soft_pseudo_logits)
             else:
-                self.soft_psuedo_logits_rel = None
                 self.g_pos_pseudo = construct_dd_only_graph(additional_train)
-        else:
-            self.g_pos_pseudo = None
 
         self.df, self.df_train, self.df_valid, self.df_test = df, df_train, df_valid, df_test
+        # self.kg_all = create_dgl_graph(df, df) ## used for computing the Local Structure (LS) vectors
+
+        self.g_pos_dd = construct_dd_only_graph(df_train)
         self.disease_eval_idx = disease_eval_idx
         self.no_kg = no_kg
         self.seed = seed

@@ -12,54 +12,19 @@
 
 
 
-## Need to run
-# LSP mode? 
-# random100 mode? 
+
+
+## Things to try:
+## use KL divergence loss instead of CE
+## try evaluation (valid/test) without DPM
 
 ## Running
-# python -u noisy_student.py test_proper_100 --repeat 1 --iter 0 --random_seed
-python -u noisy_student.py test_proper_120 --repeat 1 --iter 0 --random_seed
-
-# python -u noisy_student.py proper_80 --repeat 3 --iter 0 --generate_inog \
-#         --use_og --neg_pseudo_sampling --soft_pseudo --teacher_size 80
-# python -u noisy_student.py KD80_soft_pseudo_inog_pneg --repeat 3 --iter 1 --generate_inog \
-#         --use_og --neg_pseudo_sampling --soft_pseudo --teacher_size 100 --student_size 80
-
-# python -u noisy_student.py KD80_soft_pseudo_inog_pneg_random20 --repeat 3 --iter 1 --generate_inog \
-#         --use_og --neg_pseudo_sampling --soft_pseudo --teacher_size 100 --student_size 80 --random_pseudo_k 20
-
-# python -u noisy_student.py soft_pseudo_inog_pneg --repeat 3 --iter 2 --generate_inog \
-#         --use_og --neg_pseudo_sampling --soft_pseudo --teacher_size 100 --student_size 120
-
-# python -u noisy_student.py soft_pseudo_inog+random20_pneg --repeat 3 --iter 2 --generate_inog \
-#         --use_og --neg_pseudo_sampling --soft_pseudo --teacher_size 100 --student_size 120 --random_pseudo_k 20
-# -------------
-
-# python -u noisy_student.py proper_100_e2000_95 --repeat 3 --iter 0 --teacher_size 100
-# python -u noisy_student.py soft_pseudo_inog_pneg_wog_e2000_95 --repeat 1 --iter 2 --generate_inog \
-#         --use_og --neg_pseudo_sampling --soft_pseudo --student_size 120 --teacher_size 100
-
-# python -u noisy_student.py soft_pseudo_inog_pneg_wog_e2000_95_MLP --repeat 1 --iter 2 --generate_inog \
-#         --use_og --neg_pseudo_sampling --soft_pseudo --student_size 120 --teacher_size 100 --reparam_mode MLP
-
-# python -u noisy_student.py soft_pseudo_inog_pneg_wog_e2000_95_RMLP --repeat 3 --iter 2 --generate_inog \
-#         --use_og --neg_pseudo_sampling --soft_pseudo --student_size 120 --reparam_mode RMLP 
-
-# python -u noisy_student.py proper_100_e2000_95 --repeat 3 --iter 0 --teacher_size 100
-
-# python -u noisy_student.py proper_120_e2000_95 --repeat 2 --iter 0 --teacher_size 120
-# python -u noisy_student.py force_proper_120_e2000_95_MLP --repeat 3 --iter 0 --teacher_size 120 --reparam_mode MLP
-
-# nohup python -u noisy_student.py --reparam_mode MLP --student_size 120 > ./logs/120/e2000_0.95lr_MLP.txt
-# nohup python -u noisy_student.py --psuedo_label_fname psuedo_scores_in_og_dataset.csv --neg_pseudo_sampling --soft_pseudo --student_size 120 --use_og > ./logs/120/soft_pseudo_inog_pneg_wog_e2000_0.95lr.txt
-# nohup python -u noisy_student.py --psuedo_label_fname psuedo_scores_in_og_dataset.csv --neg_pseudo_sampling --soft_pseudo --student_size 120 --use_og --reparam_mode MLP > ./logs/120/soft_pseudo_inog_pneg_wog_e2000_0.95lr_MLP.txt
-# nohup python -u noisy_student.py --psuedo_label_fname psuedo_scores_in_og+random100.csv --soft_pseudo --student_size 120 --use_og > ./logs/120/soft_pseudo_inog+random100_pneg_wog_e2000_0.95lr.txt
+# nohup python -u noisy_student.py --student_size 120 > ./logs/120/reference_proper.txt
+nohup python -u noisy_student.py --reparam_mode MLP --student_size 120 > ./logs/120/e2000_0.95lr_MLP.txt
 # nohup python -u noisy_student.py --psuedo_label_fname psuedo_scores_in_og+random100.csv --soft_pseudo --student_size 120 --use_og > ./logs/120/soft_pseudo_inog+random100_pneg_wog_e2000_0.95lr_MLP.txt
+# nohup python -u noisy_student.py --psuedo_label_fname psuedo_scores_in_og+random100.csv --soft_pseudo --student_size 120 --use_og --reparam_mode MLP > ./logs/120/soft_pseudo_inog+random100_pneg_wog_e2000_0.95lr_MLP.txt
 
-# nohup python -u noisy_student.py --psuedo_label_fname psuedo_scores_in_og_dataset.csv --neg_pseudo_sampling --LSP RBF --LSP_size partial --soft_pseudo --student_size 100 --use_og > ./logs/LSP/soft_pseudo_inog_pneg_wog_e2000_0.95lr_RBF.txt
-# nohup python -u noisy_student.py --psuedo_label_fname psuedo_scores_in_og+random100.csv --LSP RBF --LSP_size partial --soft_pseudo --student_size 120 --use_og > ./logs/LSP/soft_pseudo_inog+random100_pneg_wog_e2000_0.95lr_RBF.txt
 
-# nohup python -u noisy_student.py --student_size 120 > ./logs/120/reference_proper2.txt
 ## Try random+100 too, since it seems like having restrained or not doesn't really matter.
 # nohup python -u noisy_student.py > ./logs/reference_performances/restrained_1_e2000__0.95lr.txt
 # nohup python -u noisy_student.py --psuedo_label_fname psuedo_scores_in_og+random100.csv --soft_pseudo --student_size 100 --use_og > ./logs/soft_pseudo_inog+random100_pneg_wog_e2000_fromrestr_0.95lr.txt

@@ -12,6 +12,8 @@ import pandas as pd
 import copy
 import os
 import random
+import pickle
+import time
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -21,7 +23,7 @@ from .graphmask.squeezer import Squeezer
 from .graphmask.sigmoid_penalty import SoftConcrete
 
 class DistMultPredictor(nn.Module):
-    def __init__(self, n_hid, w_rels, G, rel2idx, proto, proto_num, sim_measure, bert_measure, agg_measure, num_walks, walk_mode, path_length, split, data_folder, exp_lambda, device):
+    def __init__(self, n_hid, w_rels, G, rel2idx, proto, proto_num, sim_measure, bert_measure, agg_measure, num_walks, walk_mode, path_length, split, data_folder, exp_lambda, device, seed):
         super().__init__()
         
         self.proto = proto
@@ -42,6 +44,19 @@ class DistMultPredictor(nn.Module):
                            ('disease', 'rev_contraindication', 'drug'), 
                            ('disease', 'rev_indication', 'drug'),
                            ('disease', 'rev_off-label use', 'drug')]
+        self.restrained_dd_etypes = [('drug', 'contraindication', 'disease'), 
+                        ('drug', 'indication', 'disease'), ]
+        etypes_all = G.canonical_etypes ### Question: Does this always end up being all edge types? 
+        
+        self.disease_etypes_all = []
+        self.wrev_disease_etypes_all = []
+
+        for etype in etypes_all:
+            src, relation, dst = etype
+            if "rev" not in relation and (src == "disease" or dst == "disease"):
+                self.disease_etypes_all.append(etype)
+            if (src == "disease" or dst == "disease"):
+                self.wrev_disease_etypes_all.append(etype)
         
         self.node_types_dd = ['disease', 'drug']
         
@@ -83,13 +98,19 @@ class DistMultPredictor(nn.Module):
             disease_etypes = ['disease_disease', 'rev_disease_protein']
             disease_nodes = ['disease', 'gene/protein']
             
-            for etype in self.etypes_dd:
-                src, dst = etype[0], etype[2]
-                if src == 'disease':
-                    all_disease_ids = torch.where(G.out_degrees(etype=etype) != 0)[0]
-                elif dst == 'disease':
-                    all_disease_ids = torch.where(G.in_degrees(etype=etype) != 0)[0]
-                    
+            ## Precompute all similarity 
+            # etypes = self.wrev_disease_etypes_all ## For simplicity. Overcomputing things, but they are done only once anyway.
+            etypes = self.disease_etypes_all #if LSP_size else self.etypes_dd
+            all_disease_ids = torch.arange(G.num_nodes("disease"))
+            path = f"./data/{split}_{seed}"
+            if os.path.exists(f"{path}/sim_all_etypes.pkl"):
+                with open(f"{path}/sim_all_etypes.pkl", "rb") as file:
+                    self.sim_all_etypes = pickle.load(file)
+                with open(f"{path}/diseaseid2id_etypes.pkl", "rb") as file2:
+                    self.diseaseid2id_etypes = pickle.load(file2)
+                with open(f"{path}/diseases_profile_etypes.pkl", "rb") as file3:
+                    self.diseases_profile_etypes = pickle.load(file3) 
+            else:
                 if sim_measure == 'all_nodes_profile':
                     diseases_profile = {i.item(): obtain_disease_profile(G, i, disease_etypes, disease_nodes) for i in all_disease_ids}
                 elif sim_measure == 'protein_profile':
@@ -99,16 +120,37 @@ class DistMultPredictor(nn.Module):
                 elif sim_measure == 'bert':
                     diseases_profile = {i.item(): torch.Tensor(self.bert_embed[self.id2bertindex[self.disease_dict[i.item()]]]) for i in all_disease_ids}
                 elif sim_measure == 'profile+bert':
+                    ## all profile dictionary where keys are disease_ids
                     diseases_profile = {i.item(): torch.cat((obtain_disease_profile(G, i, disease_etypes, disease_nodes), torch.Tensor(self.bert_embed[self.id2bertindex[self.disease_dict[i.item()]]]))) for i in all_disease_ids}
-                    
+
+                ## sim matrix are the same for all etype (at least for the "all_nodes_profile" version)
+                ## create new "fake ids" that are contiguous using "real_ids" 
                 diseaseid2id = dict(zip(all_disease_ids.detach().cpu().numpy(), range(len(all_disease_ids))))
                 disease_profile_tensor = torch.stack([diseases_profile[i.item()] for i in all_disease_ids])
                 sim_all = sim_matrix(disease_profile_tensor, disease_profile_tensor)
-                
-                self.sim_all_etypes[etype] = sim_all
-                self.diseaseid2id_etypes[etype] = diseaseid2id
-                self.diseases_profile_etypes[etype] = diseases_profile
-                
+                for etype in etypes:
+                    print(f"storing similarity matrix based on edge type '{etype[1]}' between all disease ids")
+                # for etype in self.etypes_dd:
+                    src, dst = etype[0], etype[2]
+                    if not (src == "disease" or dst == "disease"):
+                        print("computing simlarity between two non-disease entities is pointless")
+                        raise KeyError
+                    # if src == 'disease':
+                    #     all_disease_ids_prune = torch.where(G.out_degrees(etype=etype) != 0)[0]
+                    # elif dst == 'disease':
+                    #     all_disease_ids_prune = torch.where(G.in_degrees(etype=etype) != 0)[0]
+                    self.sim_all_etypes[etype] = sim_all
+                    self.diseaseid2id_etypes[etype] = diseaseid2id
+                    self.diseases_profile_etypes[etype] = diseases_profile
+
+                with open(f"{path}/sim_all_etypes.pkl", "wb") as file:
+                    pickle.dump(self.sim_all_etypes, file)
+                with open(f"{path}/diseaseid2id_etypes.pkl", "wb") as file2:
+                    pickle.dump(self.diseaseid2id_etypes, file2)
+                with open(f"{path}/diseases_profile_etypes.pkl", "wb") as file3:
+                    pickle.dump(self.diseases_profile_etypes, file3)
+
+
     def apply_edges(self, edges):
         h_u = edges.src['h']
         h_v = edges.dst['h']
@@ -117,8 +159,72 @@ class DistMultPredictor(nn.Module):
         score = torch.sum(h_u * h_r * h_v, dim=1)
         return {'score': score}
 
+    def compute_local_structure_vectors(self, graph, sparse_LS_list, etype, LSP):
+        # h = graph.ndata['h']
+        if LSP == "cosine":
+            f_sim = torch.nn.CosineSimilarity(dim=1)
+        elif LSP == "L2":
+            f_sim = lambda src, dst: (src-dst).norm(p=2, dim=1)
+        elif LSP == "Poly":
+            f_sim = lambda src, dst: (torch.dot(src, dst) + 2)**2
+        elif LSP == "RBF":
+            f_sim = lambda src, dst: torch.exp(-0.5 * ((src - dst).norm(p=2, dim=1)**2))
+        # elif sim == "L2":
+        #     f_sim = torch.nn.CosineSimilarity(dim=1)
+        # elif sim == "L2":
+        #     f_sim = torch.nn.CosineSimilarity(dim=1)
+        else:
+            raise KeyError
+
+        # with graph.local_scope():
+        # is_src_dis = etype[0] ==  "disease"
+        def apply_f_sim(edges):
+            # result = {'sim_score': f_sim(edges.src['h'], edges.dst['h']).unsqueeze(-1)}
+            result = {'sim_score': f_sim(edges.src['h'], edges.dst['h'])}
+            return result ## useful for concatenation like [] + []
+
+        # for etype in self.disease_etypes_all:
+        graph.apply_edges(apply_f_sim, etype=etype)
+        # for node in disease_nodes:
+        src_type, dst_type = etype[0], etype[2]
+        non_dis = src_type if dst_type == "disease" else dst_type
+        src, dst = graph.edges(etype=etype)
+        edge_data = graph.edges[etype].data["sim_score"]#.to(self.device)
+        # edge_ids = torch.arange(len(src))
+        # if src_type == "disease":
+        #     print(LS[0].shape)
+        #     LS[src] = torch.cat([LS[src], edge_data[edge_ids]], dim=-1)
+        #     print(LS[0].shape)
+        # elif src_type == "disease":
+        #     LS[dst] = torch.cat([LS[dst], edge_data[edge_ids]], dim=-1)
+
+        # def append_LS(LS, key, value):
+        #     if len(LS[key]) == 0:
+        #         LS[key] = value
+        #     else:
+        #         LS[key].append(value)
+                # LS[key] = torch.cat([LS[key], value])
+        # disease_nodes = graph.nodes("disease")
+
+        ## Pretty sure you only compute LSP when graph = G
+        if src_type == "disease":
+            sparse_LS_list.append({'indices': torch.stack([src, dst]), 'values': edge_data, 'column_size': graph.num_nodes(dst_type)})
+        else:
+            sparse_LS_list.append({'indices': torch.stack([dst, src]), 'values': edge_data, 'column_size': graph.num_nodes(src_type)})
+        # LS = LS + temp
+
+        # for i, (src, dst) in enumerate(zip(src, dst)):
+        #     if src in disease_nodes:
+        #         LS[src.item()].append(edge_data[i])
+        #         # append_LS(LS, src.item(), edge_data[i])
+        #     elif dst in disease_nodes:
+        #         LS[dst.item()].append(edge_data[i])
+                # append_LS(LS, dst.item(), edge_data[i])
+        # print(f"applying f_sim {inter - strt}")
+        # print(f"appending vector to LS dictionary {time.time() - strt}")
+
     ## pseudo_training disabled dpm
-    def forward(self, graph, G, h, pretrain_mode, mode, block = None, only_relation = None, pseudo_training=False):
+    def forward(self, graph, G, h, pretrain_mode, mode, block = None, only_relation = None, pseudo_training=False, LSP=False, LSP_size=None):
         with graph.local_scope():
             scores = {}
             s_l = []
@@ -126,10 +232,12 @@ class DistMultPredictor(nn.Module):
             if len(graph.canonical_etypes) == 1:
                 etypes_train = graph.canonical_etypes
             else:
-                etypes_train = self.etypes_dd
-            
-            if pseudo_training:
-                etypes_train = graph.canonical_etypes ## if you are going to use psuedo labels and skip (off-label relations)
+            #     etypes_train = self.etypes_dd
+            # if pseudo_training:
+                etypes_train = self.restrained_dd_etypes #### IMPORTANT #### RESTRAINING DD_RELATIONS (No-rev, No off-label)
+                # etypes_train = graph.canonical_etypes ## if you are going to use psuedo labels and skip (off-label relations)
+                # print(etypes_train) #### test ####: this should be only ind, c-ind
+
             if only_relation is not None:
                 if only_relation == 'indication':
                     etypes_train = [('drug', 'indication', 'disease'),
@@ -155,16 +263,48 @@ class DistMultPredictor(nn.Module):
                     scores[etype] = out
             else:
                 # finetuning on drug disease only...
-                
-                for etype in etypes_train:
 
-                    if not pseudo_training and self.proto:
+
+                ## It seems like disease, disease_proteins are only used for "all_nodes_profile" DPM
+                if LSP_size == "full":
+                    etypes = self.disease_etypes_all
+                elif LSP_size == "partial":
+                    etypes = [("disease", 'disease_disease', "disease"),
+                              ('gene/protein', 'disease_protein', 'disease')]
+                else:
+                    etypes = etypes_train
+
+                if LSP:
+                    ## Create a LS dictionary (w/ LS vectors) that will get updated every etype iteration
+                    ## contains ingrediants to concatenate to create a final sparse LS tensor which will be compressed during loss computation.
+                    sparse_LS_list = [] 
+                    # disease_nodes = graph.nodes("disease")
+                    # n_dis = G.num_nodes("disease")
+                    # n_max = max([max(G.num_nodes(src), G.num_nodes(dst)) for src, _, dst in etypes]) 
+                    # LS = torch.sparse_coo_tensor(torch.empty((2, 0)), torch.empty(0), (n_dis, n_max), device=self.device) ## [N, N, E]
+                    # LS = torch.zeros(n_dis, n_max, len(etypes), device=self.device) ## [N, N, E]
+                    # LS = [[] for node in disease_nodes]
+                    # LS = {node.item(): [] for node in disease_nodes}
+                # etypes_strt = time.time()
+                for i, etype in enumerate(etypes):
+                    # if LSP:
+                        # if etype[1] == "indication":
+                        #     graph_src, graph_dst = graph.edges(etype)
+                        # for dst in graph_dst:
+                        #     if dst not in self.diseaseid2id_etypes[etype].keys():
+                        #         print("so it shouldn't work right? ")
+                        #         raise KeyError
+
+                    if self.proto: #### TESTING #### PSEUDO TRAINIGN W/ DPM (ONLY UTILIZING TRAIN PSEUDO SCORES)
+                    # if not pseudo_training and self.proto:
                         src, dst = etype[0], etype[2]
+                        # ## Eval g's embeddings in etype
                         src_rel_idx = torch.where(graph.out_degrees(etype=etype) != 0)
                         dst_rel_idx = torch.where(graph.in_degrees(etype=etype) != 0)
-                        src_h = h[src][src_rel_idx]
+                        src_h = h[src][src_rel_idx] ## obtain node type's h and advance index eval_g's diseases
                         dst_h = h[dst][dst_rel_idx]
 
+                        # ## Train Graph's embeddings in etype
                         src_rel_ids_keys = torch.where(G.out_degrees(etype=etype) != 0)
                         dst_rel_ids_keys = torch.where(G.in_degrees(etype=etype) != 0)
                         src_h_keys = h[src][src_rel_ids_keys]
@@ -184,10 +324,14 @@ class DistMultPredictor(nn.Module):
                             h_disease['disease_key_id'] = dst_rel_ids_keys
 
                         if self.sim_measure in ['protein_profile', 'all_nodes_profile', 'protein_random_walk', 'bert', 'profile+bert']:
-
                             try:
+                                ## Here you are trying to access the similary vector ??(only contains df_train's disease sim vectors)
                                 sim = self.sim_all_etypes[etype][np.array([self.diseaseid2id_etypes[etype][i.item()] for i in h_disease['disease_query_id'][0]])]
+                                ## Pruning of sim matrix where we do not consider nodes without this relation (prevents index error later)
+                                sim = sim[:, h_disease['disease_key_id'][0].cpu()].to(self.device)
+                                print(f"Using stored similarity matrix for {etype}")
                             except:
+                                print(f"Computing similarity matrix for out of distribution data for {etype}")
                                 
                                 disease_etypes = ['disease_disease', 'rev_disease_protein']
                                 disease_nodes = ['disease', 'gene/protein']
@@ -214,16 +358,55 @@ class DistMultPredictor(nn.Module):
 
                                 sim = sim_matrix(profile_query, profile_keys)
 
-                            if src_h.shape[0] == src_h_keys.shape[0]:
+                            # if src_h.shape[0] == src_h_keys.shape[0]:
                                 ## during training...
-                                coef = torch.topk(sim, self.k + 1).values[:, 1:]
-                                coef = F.normalize(coef, p=1, dim=1)
-                                embed = h_disease['disease_key'][torch.topk(sim, self.k + 1).indices[:, 1:]]
-                            else:
-                                ## during evaluation...
-                                coef = torch.topk(sim, self.k).values[:, :]
-                                coef = F.normalize(coef, p=1, dim=1)
-                                embed = h_disease['disease_key'][torch.topk(sim, self.k).indices[:, :]]
+
+                            # masking of whether eval_g's node is seen in the Train_G
+                            mask = torch.isin(h_disease['disease_query_id'][0], h_disease['disease_key_id'][0])
+
+                            ## any eval_g is in Train_G
+                            coef = torch.zeros(sim.size(0), self.k, device=self.device)
+                            embed = torch.zeros(h_disease['disease_query'].size(0), self.k, h_disease['disease_query'].size(1), device=self.device)
+                            # seen_any = mask.nonzero().squeeze() > 0
+                            seen = mask.nonzero().squeeze(dim=-1) ## what does squeeze() do here? 
+                            if len(seen) > 0:
+                                topk_values, topk_indices = torch.topk(sim[seen], self.k + 1, dim=1)
+                                coef[seen, :] = F.normalize(topk_values[:, 1:], p=1, dim=1)
+                                embed[seen] = h_disease['disease_key'][topk_indices[:, 1:]]
+
+                            # try: 
+                            unseen = (~mask).nonzero().squeeze(dim=-1)
+                            if len(unseen) > 0:
+                                topk_values, topk_indices = torch.topk(sim[unseen], self.k, dim=1)
+                                coef[unseen, :] = F.normalize(topk_values, p=1, dim=1)
+                                embed[unseen] = h_disease['disease_key'][topk_indices]
+
+                            # print("Does this slick trick work? ")
+                            # topk_values, topk_indices = torch.topk(sim, self.k, dim=1)
+                            # coef = F.normalize(topk_values, p=1, dim=1) 
+                            # embed = h_disease['disease_key'][topk_indices]
+
+                            # print(seen.shape)
+                            # print(seen)
+                            # except Exception as e:
+                            # print(f"excpetion: {e}")
+                            # print(mask)
+                            # print(seen)
+                            # print(unseen)
+                            # print(h_disease['disease_query_id'][0].shape)
+                            # print(h_disease['disease_key_id'][0].shape)
+                            # coef = torch.topk(sim, self.k + 1).values[:, 1:]
+                            # coef = F.normalize(coef, p=1, dim=1)
+                            # embed = h_disease['disease_key'][torch.topk(sim, self.k + 1).indices[:, 1:]]
+
+                            # else:
+                            #     ## during evaluation...
+                            #     coef = torch.topk(sim, self.k).values[:, :]
+                            #     coef = F.normalize(coef, p=1, dim=1)
+                                # embed = h_disease['disease_key'][torch.topk(sim, self.k).indices[:, :]]
+
+                            ## embed [N, k, F]
+                            ## coef [N, k]
                             out = torch.mul(embed, coef.unsqueeze(dim = 2).to(self.device)).sum(dim = 1)
 
                         if self.sim_measure in ['protein_profile', 'all_nodes_profile', 'protein_random_walk', 'bert', 'profile+bert']:
@@ -271,25 +454,69 @@ class DistMultPredictor(nn.Module):
 
                         graph.ndata['h'] = h
 
-                    graph.apply_edges(self.apply_edges, etype=etype)  
-                    out = graph.edges[etype].data['score']
-                    s_l.append(out)
-                    scores[etype] = out
+                    if LSP:
+                        self.compute_local_structure_vectors(graph, sparse_LS_list, etype, LSP=LSP)
+                    
+                    if etype in self.restrained_dd_etypes:
+                        graph.apply_edges(self.apply_edges, etype=etype)
+                        out = graph.edges[etype].data['score']
+                        srcdst = graph.edges(etype=etype[1])
 
-                    if not pseudo_training and self.proto:
+                        s_l.append(out)
+                        scores[etype] = out
+                        scores[f"{etype}_srcdst"] = srcdst
+
+                    if self.proto: #### TESTING #### PSEUDO TRAINIGN W/ DPM (ONLY UTILIZING TRAIN PSEUDO SCORES)
+                    # if not pseudo_training and self.proto:
                         # recover back to the original embeddings for other relations
                         h[src][src_rel_idx] = src_h
                         h[dst][dst_rel_idx] = dst_h
+                # print(f"etypes for loop time taken: {time.time() - etypes_strt}")
+
+            if LSP:  
+                # print("worked until here")
+                # LS = LS.sum(dim=-1)
+                # for i, v in enumerate(LS):
+                #     if len(v) > 0:
+                #         LS[i] = torch.cat(v)
+                strt = time.time()
+                final_indices = []
+                final_values = []
+                indices_cursor = 0
+                for LS_dict in sparse_LS_list:
+                    indices, values, max_node = LS_dict["indices"], LS_dict["values"], LS_dict["column_size"], 
+                    pad_indices = torch.stack([indices[0], indices[1]+indices_cursor])
+                    final_indices.append(pad_indices)
+                    final_values.append(values)
+                    indices_cursor += max_node
+
                 
+                final_indices = torch.cat(final_indices, dim=-1)
+                final_values = torch.cat(final_values)
+
+                LS = []
+                for i in range(G.num_nodes('disease')):
+                    ## masking of row indices
+                    mask = final_indices[0] == i
+                    LS.append(final_values[mask])
+                # LS = torch.sparse_coo_tensor(final_indices, final_values, (G.num_nodes("disease"), indices_cursor))
+                print(f"time it took to create the sparse tensor: {time.time() - strt}")
+                return scores, s_l, LS
+            
             if pretrain_mode or pseudo_training:
-                s_l = torch.cat(s_l)             
+                if len(s_l) > 0:
+                    s_l = torch.cat(s_l)           
+                else:
+                    s_l = []
             else: 
                 s_l = torch.cat(s_l).reshape(-1,).detach().cpu().numpy()
+
             return scores, s_l
 
 
     
 class AttHeteroRGCNLayer(nn.Module):
+
     def __init__(self, in_size, out_size, etypes):
         super(AttHeteroRGCNLayer, self).__init__()
         self.weight = nn.ModuleDict({
@@ -443,7 +670,7 @@ class HeteroRGCNLayer(nn.Module):
         return {ntype : G.nodes[ntype].data['h'] for ntype in G.ntypes}, penalty, self.num_masked
     
 class HeteroRGCN(nn.Module):
-    def __init__(self, G, in_size, hidden_size, out_size, attention, proto, proto_num, sim_measure, bert_measure, agg_measure, num_walks, walk_mode, path_length, split, data_folder, exp_lambda, device, dropout=False, reparam_mode=False):
+    def __init__(self, G, in_size, hidden_size, out_size, attention, proto, proto_num, sim_measure, bert_measure, agg_measure, num_walks, walk_mode, path_length, split, data_folder, exp_lambda, device, dropout=False, reparam_mode=False, seed=1):
         super(HeteroRGCN, self).__init__()
 
         if attention:
@@ -458,7 +685,8 @@ class HeteroRGCN(nn.Module):
         nn.init.xavier_uniform_(self.w_rels, gain=nn.init.calculate_gain('relu'))
         rel2idx = dict(zip(G.canonical_etypes, list(range(len(G.canonical_etypes)))))
                
-        self.pred = DistMultPredictor(n_hid = hidden_size, w_rels = self.w_rels, G = G, rel2idx = rel2idx, proto = proto, proto_num = proto_num, sim_measure = sim_measure, bert_measure = bert_measure, agg_measure = agg_measure, num_walks = num_walks, walk_mode = walk_mode, path_length = path_length, split = split, data_folder = data_folder, exp_lambda = exp_lambda, device = device)
+        self.pred = DistMultPredictor(n_hid = hidden_size, w_rels = self.w_rels, G = G, rel2idx = rel2idx, proto = proto, proto_num = proto_num, sim_measure = sim_measure, bert_measure = bert_measure, agg_measure = agg_measure, num_walks = num_walks, 
+                                      walk_mode = walk_mode, path_length = path_length, split = split, data_folder = data_folder, exp_lambda = exp_lambda, device = device, seed=seed)
         self.attention = attention
         
         self.hidden_size = hidden_size
@@ -501,14 +729,20 @@ class HeteroRGCN(nn.Module):
                         nn.Linear(2*out_size, out_size),
                     ) for name in G.ntypes
                     })
-                
+
+    def extract_distmult(self,):
+        return self.pred
+                        
     def total_kl_loss(self, mu_dict=None, logstd_dict=None):
         total_kl_div = 0
         MAX_LOGSTD = 10
         for key in mu_dict.keys():
-            mu = mu_dict[key]
+            mu = mu_dict[key].clone() ### solving gradient in-place operation error/ 
             logstd = logstd_dict[key].clamp(max=MAX_LOGSTD)
-            total_kl_div += -0.5 * torch.mean(torch.sum(1 + 2 * logstd - mu**2 - logstd.exp()**2, dim=1))
+            # mu_squared = mu ** 2
+            # logstd_squared = logstd ** 2
+            kl_div = - 0.5 * torch.mean(torch.sum(1 + 2 * logstd - mu**2 - logstd.exp()**2, dim=1))
+            total_kl_div += kl_div
         return total_kl_div
     
     def reparameterize(self, mean_dict, logvar_dict, train=False):
@@ -556,7 +790,7 @@ class HeteroRGCN(nn.Module):
         return scores, scores_neg, out_pos, out_neg, beta_kl_loss
         
     
-    def forward(self, G, neg_G, eval_pos_G = None, return_h = False, return_att = False, mode = 'train', pretrain_mode = False, pseudo_training=False, return_h_and_kl=False):
+    def forward(self, G, neg_G = None, eval_pos_G = None, return_h = False, return_att = False, mode = 'train', pretrain_mode = False, pseudo_training=False, return_h_and_kl=False):
         with G.local_scope():
             input_dict = {ntype : G.nodes[ntype].data['inp'] for ntype in G.ntypes}
 

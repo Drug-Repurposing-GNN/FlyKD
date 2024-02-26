@@ -327,8 +327,10 @@ class Full_Graph_NegSampler:
                 etype: -g.out_degrees(etype=etype).float() ** 0.75
                 for etype in g.canonical_etypes
             }
-        elif method == 'fix_dst': ## weight is a binary 0 or 1 tensor in order to allow negative sampling to happen only on nodes with relations
+        elif method == 'fix_dst': 
+            ## weight is a binary 0 or 1 tensor in order to allow negative sampling to happen only on nodes with relations
             self.weights = {
+                ## Creates 0 or 1 distribution using TRAIN GRAPH. For Pseudo: you might want to create a separate Full_Graph_Negsampler
                 etype: (g.in_degrees(etype=etype) > 0).float()
                 for etype in g.canonical_etypes
             }
@@ -395,7 +397,6 @@ def get_all_metrics(y, pred, rels):
             micro_auprc, macro_auroc, macro_auprc
 
 def get_all_metrics_fb(pred_score_pos, pred_score_neg, scores, labels, G, full_mode = False):
-
     auroc_rel = {}
     auprc_rel = {}
     
@@ -437,8 +438,67 @@ def evaluate(model, valid_data, G):
     scores = torch.sigmoid(logits_valid) 
     return get_all_metrics(valid_data.label.values, scores.cpu().detach().numpy(), rels)
 
+def obtain_LS_matrix(model, g_eval, G):
+    ## On Train dataset for now? But we can also do it on validation and test split
+    # distmult = model.extract_distmult()
+    with torch.no_grad():
+        h, beta_kl_loss, distmult = model(G, pretrain_mode = False, mode = 'train', return_h_and_kl=True) 
+        pseudo_pos_scores_rel, _, LS = distmult(g_eval, G, h, mode=None, pretrain_mode=False, pseudo_training=True, LSP=True)
+    return LS
+
+def evaluate_accuracy_per_split(model, train_pos, train_neg, val_pos, val_neg, test_pos, test_neg, device=None):
+    # device = device if device is not None else torch.device("cuda")
+    G = train_pos
+    model.eval()
+    def evalute_accuracy(g_pos, g_neg):
+            pred_score_pos, pred_score_neg, pos_score, neg_score, _ = model(G, g_neg, g_pos, pretrain_mode = False, mode = "mode")
+            pos_scores = torch.cat([pred_score_pos[i] for i in pseudo_dd_etypes])
+            neg_scores = torch.cat([pred_score_neg[i] for i in pseudo_dd_etypes])
+            ## returns both pos and neg accuracy by looking at boundary
+            pos_acc = torch.tensor(pos_scores > 0).float().mean()
+            neg_acc = torch.tensor(neg_scores < 0).float().mean()
+            return pos_acc, neg_acc
+    
+    with torch.no_grad():
+        pseudo_dd_etypes = [('drug', 'contraindication', 'disease'), 
+                            ('drug', 'indication', 'disease'), ]
+        train_pos_acc, train_neg_acc = evalute_accuracy(train_pos, train_neg)
+        valid_pos_acc, valid_neg_acc = evalute_accuracy(val_pos, val_neg)
+        test_pos_acc, test_neg_acc = evalute_accuracy(test_pos, test_neg)
+    return {"train": [train_pos_acc, train_neg_acc], "val": [valid_pos_acc, valid_neg_acc], "test": [test_pos_acc, test_neg_acc]}
+
+def print_val_test_auprc(best_model, g_valid_pos, g_valid_neg, g_test_pos, g_test_neg, G, dd_etypes, device):
+    (auroc_rel, auprc_rel, micro_auroc, micro_auprc, macro_auroc, macro_auprc), loss = evaluate_fb(best_model, g_valid_pos, g_valid_neg, G, dd_etypes, device, mode = 'valid')
+    print('Validation Loss %.4f,  Validation Micro AUROC %.4f Validation Micro AUPRC %.4f Validation Macro AUROC %.4f Validation Macro AUPRC %.4f' % (
+        loss,
+        micro_auroc,
+        micro_auprc,
+        macro_auroc,
+        macro_auprc,
+    ))
+    print('----- AUROC Performance in Each Relation -----')
+    print_dict(auroc_rel)
+    print('----- AUPRC Performance in Each Relation -----')
+    print_dict(auprc_rel)
+    print('----------------------------------------------')
+
+    (auroc_rel, auprc_rel, micro_auroc, micro_auprc, macro_auroc, macro_auprc), loss, pred_pos, pred_neg = evaluate_fb(best_model, g_test_pos, g_test_neg, G, dd_etypes, device, True, mode = 'test')
+    print('Testing Loss %.4f Testing Micro AUROC %.4f Testing Micro AUPRC %.4f Testing Macro AUROC %.4f Testing Macro AUPRC %.4f' % (
+        loss,
+        micro_auroc,
+        micro_auprc,
+        macro_auroc,
+        macro_auprc
+    ))
+    print('----- AUROC Performance in Each Relation -----')
+    print_dict(auroc_rel)
+    print('----- AUPRC Performance in Each Relation -----')
+    print_dict(auprc_rel)
+    print('----------------------------------------------')
+
 def evaluate_fb(model, g_pos, g_neg, G, dd_etypes, device, return_embed = False, mode = 'valid'):
     model.eval()
+    import time
     with torch.no_grad():
         pred_score_pos, pred_score_neg, pos_score, neg_score, _ = model(G, g_neg, g_pos, pretrain_mode = False, mode = mode)
         
@@ -559,14 +619,18 @@ def disable_all_gradients(module):
     for param in module.parameters():
         param.requires_grad = False
 
-def print_dict(x, dd_only = True):
+def print_dict(x, dd_only = True, restrained=True):
     if dd_only:
-        etypes = [('drug', 'contraindication', 'disease'), 
-                  ('drug', 'indication', 'disease'), 
-                  ('drug', 'off-label use', 'disease'),
-                  ('disease', 'rev_contraindication', 'drug'), 
-                  ('disease', 'rev_indication', 'drug'), 
-                  ('disease', 'rev_off-label use', 'drug')]
+        if restrained:
+            etypes = [('drug', 'contraindication', 'disease'), 
+                    ('drug', 'indication', 'disease'),]
+        else:
+            etypes = [('drug', 'contraindication', 'disease'), 
+                    ('drug', 'indication', 'disease'), 
+                    ('drug', 'off-label use', 'disease'),
+                    ('disease', 'rev_contraindication', 'drug'), 
+                    ('disease', 'rev_indication', 'drug'), 
+                    ('disease', 'rev_off-label use', 'drug')]
         
         for i in etypes:
             print(str(i) + ': ' + str(x[i]))
@@ -1096,6 +1160,9 @@ def disease_centric_evaluation(df, df_train, df_valid, df_test, data_path, G, mo
         labels_contra = {}
         ids_contra = {}
 
+        with torch.no_grad():
+            h, _, distmult = model(G, pseudo_training=disable_dpm, return_h_and_kl=True)
+
         for disease_id in tqdm(disease_ids):
 
             candidate_pos = df_rel_dd[df_rel_dd.x_idx == disease_id]#[['x_idx', 'y_idx']]
@@ -1113,20 +1180,23 @@ def disease_centric_evaluation(df, df_train, df_valid, df_test, data_path, G, mo
                 else:
                     labels[i] = 0
 
-            # construct eval graph
+            # construct eval graph (a disease is connected to all drugs, use precomputed values from G to compute the prob. scores)
             out = {}
             src = torch.Tensor([disease_id] * len(labels)).to(device).to(dtype = torch.int64)
             dst = torch.Tensor(list(labels.keys())).to(device).to(dtype = torch.int64)
-            out.update({('disease', rel, 'drug'): (src, dst)})
+            out.update({('drug', rel, 'disease'): (dst, src)})
+            # out.update({('disease', rel, 'drug'): (src, dst)})
 
             g_eval = dgl.heterograph(out, num_nodes_dict={ntype: G.number_of_nodes(ntype) for ntype in G.ntypes}).to(device)
             
             model.eval()
             with torch.no_grad():
-                _, pred_score_rel, _, pred_score, _ = model(G, g_eval, pseudo_training=disable_dpm) 
-            pred = pred_score_rel[('disease', rel, 'drug')].reshape(-1,).detach().cpu().numpy()
-            lab = {idx2id_drug[i]: labels[i] for i in g_eval.edges()[1].detach().cpu().numpy()}
-            preds_contra[idx2id_disease[disease_id]] = {idx2id_drug[i]: pred[idx] for idx, i in enumerate(g_eval.edges()[1].detach().cpu().numpy())}
+                pred_score_rel, pred_score = distmult(g_eval, G, h, pretrain_mode=False, mode=None)
+
+            pred = pred_score_rel[('drug', rel, 'disease')].reshape(-1,).detach().cpu().numpy()
+            # pred = pred_score_rel[('disease', rel, 'drug')].reshape(-1,).detach().cpu().numpy()
+            lab = {idx2id_drug[i]: labels[i] for i in g_eval.edges()[0].detach().cpu().numpy()}
+            preds_contra[idx2id_disease[disease_id]] = {idx2id_drug[i]: pred[idx] for idx, i in enumerate(g_eval.edges()[0].detach().cpu().numpy())}
             labels_contra[idx2id_disease[disease_id]] = lab
             # ids_contra[idx2id_disease[disease_id]] = g_eval.edges()[1].detach().cpu().numpy()
 
@@ -1215,12 +1285,14 @@ def disease_centric_evaluation(df, df_train, df_valid, df_test, data_path, G, mo
         # return out
     
         temp_d, preds_all, labels_all, org_out_all, metrics_all, ranked_Ids, ranked_list, name, dis_id, dis_idx, ranked_Idxs, ranked_scores = {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
-        rel_type = 'rev_' + relation ## Q. why add rev_ ??
+        # rel_type = 'rev_' + relation ## Q. why add rev_ ??
+        rel_type = relation ## Q. why add rev_ ??
         preds_, labels_, drug_idxs, drug_names = get_scores_disease(rel_type, disease_ids, disable_dpm=False) ## Think we still need dpm? Can also try without it and see if pseudo labels can replace them. 
         preds_all[rel_type] = preds_ ## Q. shouldn't the rel_type be in the dictionary as key then? A. No, because we are returning preds_all[relation] not preds_all
         labels_all[rel_type] = labels_
         ids_all = list(preds_all[rel_type].keys())
         id2idx_disease = {id:idx for idx, id in idx2id_disease.items()}
+        concat_dfs = []
         for entity_id in ids_all:
             pred = preds_all[rel_type][entity_id]
             lab = labels_all[rel_type][entity_id]
@@ -1233,9 +1305,21 @@ def disease_centric_evaluation(df, df_train, df_valid, df_test, data_path, G, mo
 
             ranked_Ids[entity_id] = [id2idx[i] for i in ranked_list_entity]
             # name[entity_id] = id2name_disease[entity_id]
-            dis_idx[entity_id] = id2idx_disease[entity_id]
+            dis_idx[entity_id] = id2idx_disease[entity_id] ## the original implementation flipped id and idx? 
+
+        #     ## Let's create a dataframe for each disease and concatenate it
+        #     print(len(ranked_scores[entity_id]), len(ranked_Idxs[entity_id]), len(ranked_Ids[entity_id]))
+        #     n = len(ranked_scores[entity_id])
+        #     broadcasted_y_id = [entity_id] * n
+        #     broadcasted_y_idx = [dis_idx] * n
+        #     broadcasted_relation = [relation] * n
+        #     tempt_df = pd.DataFrame({'y_id': broadcasted_y_id, 'y_idx': broadcasted_y_idx, 'relation': broadcasted_relation, 'x_id': ranked_Ids[entity_id], 'x_idx': ranked_Idxs[entity_id], 'score': ranked_scores[entity_id]})
+        #     # 1, 1, 1, n, n, n
+        #     concat_dfs.append(tempt_df)
+        # out_df = pd.concat(concat_dfs, ignore_index=True)
 
         out = {"dis_idx":dis_idx, "ranked_drug_ids": ranked_Ids, "ranked_drug_idxs": ranked_Idxs, "ranked_scores": ranked_scores}
+        # return out_df
         return out
         # return "let's seed the speed"
 
