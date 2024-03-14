@@ -1,10 +1,5 @@
-# import torch, dgl, accelerate
 from txgnn import TxData, TxGNN, TxEval
 from txgnn.utils import create_split, print_val_test_auprc
-# import torch.nn as nn
-# import torch.nn.functional as F
-# from accelerate.utils import set_seed
-# from dgl.distributed import partition_graph
 import numpy as np
 import time
 import pandas as pd
@@ -13,15 +8,6 @@ import os
 import sys
 import pprint
 import random
-# saving_path = './saved_models/'
-# split = 'random'
-# split = 'complex_disease'
-# split = 'cell_proliferation'
-# split = 'mental_health'
-# split = 'cardiovascular'
-# split = 'anemia'
-# split = 'adrenal_gland'
-# print(split)
 
 '''
     Let's first try one iteration to increase performance.
@@ -46,11 +32,6 @@ def obtain_disease_idx(TxData1, deg):
     disease_drug_degree.sum()
 
     ## length of ID
-    # drug_ids_x = kg[kg['x_type'] == 'drug']['x_id']
-    # drug_ids_y = kg[kg['y_type'] == 'drug']['y_id']
-    # drug_ids_value_count = pd.concat([drug_ids_x, drug_ids_y]).value_counts()
-    # drug_ids_value_count
-
     low_disease = disease_drug_degree[disease_drug_degree < deg]
 
     id_mapping = TxData1.retrieve_id_mapping()
@@ -68,10 +49,6 @@ def disease_idx_wout_val_test(seed, args):
     kg_path = data_folder + 'kg_directed.csv'
     df = pd.read_csv(kg_path)
     df_train, df_valid, df_test = create_split(df, args.split, None, None, seed)
-    # df_dd_y_id = df[df.relation.isin(["indication", "contraindication"])].y_idx
-    # df_dd_valid_y_id = df_valid[df_valid.relation.isin(["indication", "contraindication"])].y_idx
-    # df_dd_test_y_id = df_test[df_test.relation.isin(["indication", "contraindication"])].y_idx
-    # no_valid_test = df_dd_y_id[(~df_dd_y_id.isin(df_dd_valid_y_id)) & (~df_dd_y_id.isin(df_dd_test_y_id))]
 
     df_dd_x_idx = df[df.x_type == "disease"].x_idx
     df_dd_y_idx = df[df.y_type == "disease"].y_idx
@@ -107,12 +84,6 @@ def obtain_high_degree_disease_id_w_df(pseudo_train, seed, deg):
     disease_drug_degree.sum()
 
     ## length of ID
-    # drug_ids_x = kg[kg['x_type'] == 'drug']['x_id']
-    # drug_ids_y = kg[kg['y_type'] == 'drug']['y_id']
-    # drug_ids_value_count = pd.concat([drug_ids_x, drug_ids_y]).value_counts()
-    # drug_ids_value_count
-
-    # disease_drug_degree.index.values
     high_disease_series = disease_drug_degree[disease_drug_degree >= deg]
     high_drug_series = drugs_value_counts[drugs_value_counts >= deg]
     high_disease_set = set(high_disease_series.index)
@@ -120,26 +91,6 @@ def obtain_high_degree_disease_id_w_df(pseudo_train, seed, deg):
     filtered_pseudo_train = pseudo_train[(pseudo_train.y_id.isin(high_disease_set)) & (pseudo_train.x_id.isin(high_drug_set))]
     return filtered_pseudo_train
 
-
-# def turn_into_dataframe(results, t, least_score):
-#     '''
-#         t = number of psuedo_labels to be generated for low_diseases
-#         Takes in the results eval file and returns the disease idx that have less than k degrees (drug-disease relation)
-#     '''
-#     additional_train_dict = []
-#     for rel, result in results.items():
-#         for (dis_id, drug_ids), drug_idxs, dis_idx, ranked_scores in zip(result['ranked_drug_ids'].items(), result['ranked_drug_idxs'].values(), result['dis_idx'].values(), result['ranked_scores'].values()):
-#             if least_score is None:
-#                 new_dicts = [{'y_id': dis_id, 'y_idx': dis_idx, 'x_id': drug_id, 'x_idx': drug_idx, 'relation': rel, 'score': ranked_scores[i]} for i, (drug_id, drug_idx) in enumerate(zip(drug_ids, drug_idxs)) if i < t]
-#             else:
-#                 new_dicts = [{'y_id': dis_id, 'y_idx': dis_idx, 'x_id': drug_id, 'x_idx': drug_idx, 'relation': rel, 'score': ranked_scores[i]} for i, (drug_id, drug_idx, ranked_score) in enumerate(zip(drug_ids, drug_idxs, ranked_scores)) if ranked_score > least_score]
-#             additional_train_dict += new_dicts
-
-#     df = pd.DataFrame(additional_train_dict)
-#     df["x_idx"] = df["x_idx"].astype(float)
-#     df["y_type"] = "disease"
-#     df["x_type"] = "drug"
-#     return df
 
 def _turn_into_df_helper(result, rel, dd_df, args):
     random_k, k_top_bottom_candidates, strong_scores =  args.random_pseudo_k, args.k_top_bottom_candidates, args.strong_scores
@@ -160,9 +111,6 @@ def _turn_into_df_helper(result, rel, dd_df, args):
         ## generate pseudo labels on existing relations
         temp_df = pd.DataFrame(new_dicts)
         concat_df_dd.append(temp_df)
-        # temp_dd_df = temp_df.merge(dd_df[['x_id', 'y_id', 'relation']], on=['x_id', 'y_id', 'relation'], how="inner")
-        # concat_df_dd.append(temp_dd_df)
-        ## extra_dict (non-existing relation)
         if extra_dicts is not None:
             extra_df = pd.DataFrame(extra_dicts)        
             extra_df_dd.append(extra_df)
@@ -202,9 +150,6 @@ def turn_into_df(results, txdata, args,):
     for rel, result in results.items():
         concat_df.append(_turn_into_df_helper(result, rel, dd_df, args,))
     pseudo_df = pd.concat(concat_df)
-    # print(f"Concatenation time taken: {time.time() - strt}")
-    # print(f"transformation finished! Time taken: {time.time() - inter}")
-    # pseudo_df.to_csv(os.path.join(save_dir, "pseudo_df.csv"), index=False)
     return pseudo_df
 
 
@@ -212,15 +157,10 @@ def init_logfile(i, seed, args):
     '''
         create and set logfile to be written. Also write init messages such as args and seed
     '''
-    # if 'force' in args.fname:
-    #     save_dir = './' + args.fname + '/'
-    # else:
-    # save_dir = f"./e1000_eval_perf/{args.fname}/{seed}/" 
     if args.epochs:
         save_dir = f"./e{args.epochs}/{args.fname}/{seed}/"
     else:
         save_dir = f"./after_saving_rev_e1200_90/{args.fname}/{seed}/" 
-    # save_dir = f'./logs/eval_perf/{args.fname}/{seed}/'
 
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
@@ -249,51 +189,10 @@ def print_val_test_auprc_w_path(pretrained_path, split, seed):
     best_G = TxGNN1.best_G.to(TxGNN1.device)
     best_model = TxGNN1.best_model.to(TxGNN1.device)
     best_model.eval()
-    # neg_sampler = Full_Graph_NegSampler(TxGNN1.G, 1, 'fix_dst', TxGNN1.device)
-    # g_train_neg = neg_sampler(TxGNN1.G)
     g_valid_pos, g_valid_neg = TxGNN1.g_valid_pos, TxGNN1.g_valid_neg
     g_test_pos, g_test_neg = TxGNN1.g_test_pos, TxGNN1.g_test_neg
     print_val_test_auprc(best_model, g_valid_pos, g_valid_neg, g_test_pos, g_test_neg, best_G, TxGNN1.dd_etypes, TxGNN1.device)
     
-# def generate_and_save_pseudo_labels(pre_trained_dir, save_dir, size, seed, args):
-#     '''
-#         with open(args.psuedo_label_fname[:-4] + f'_{k}.pkl', 'wb') as f:
-#         first size prolly needs to be 100 then whatever size afterwards
-#         also want to set pre_trained dir to 'properly_pre_trained_model_ckpt/seed_1_restrained_saveG' and then wherever the newly trained model is.
-
-#         use generate_inog to generate pseudo labels much faster
-#     '''
-#     print(f"Generating pseudo labels with pre-trained model. Generate only on existing edges is set to {args.generate_inog}")
-#     if args.generate_indication:
-#         mode = "indication"
-#     elif args.generate_contraindication:
-#         mode = "contraindication"
-#     else:
-#         mode = "both"
-
-#     # if args.train_then_generate:
-#     #     ## used for training then generating psuedo labels to avoid save-loading error
-#     #     print(f"Training THEN generate without save/loading the model: {args.psuedo_label_fname}")
-#     #     pseudo_labels = train_then_generate_psuedo_labels(split=args.split, size=100, seed=seed, deg=args.deg, k_top_candidates=args.k_top_candidates, least_score=args.least_score, mode=mode)
-#     #     # pseudo_labels.to_csv(args.psuedo_label_fname, index=False)
-#     # else:
-#     ## only for generating psuedo labels using pre-trained model
-#     pseudo_labels = generate_pseudo_labels(pre_trained_dir=pre_trained_dir, 
-#                                             split=args.split, 
-#                                             size=size, 
-#                                             seed=seed, 
-#                                             deg=args.deg, 
-#                                             k_top_candidates=args.k_top_candidates, 
-#                                             least_score=args.least_score,
-#                                             mode=mode,
-#                                             generate_inog=args.generate_inog)
-#     for k, p_labels in pseudo_labels.items():
-#         if p_labels is not None:
-#             with open(save_dir + f'_{k}.pkl', 'wb') as f:
-#                 pickle.dump(p_labels, f, protocol=pickle.HIGHEST_PROTOCOL)
-#             file_size = os.path.getsize(save_dir + f'_{k}.pkl')
-#             print(file_size)
-
 # def generate_pseudo_labels(pre_trained_dir, size, seed, mode=None):
 def generate_pseudo_labels(pre_trained_dir, size, seed, args, mode=None):
     '''
@@ -316,10 +215,6 @@ def generate_pseudo_labels(pre_trained_dir, size, seed, args, mode=None):
     txGNN.load_pretrained(pre_trained_dir)
 
     if args.debug:
-        # n = 100
-        # dd_df = TxData1.df_train
-        # ind_idx = dd_df[dd_df.relation == "indication"].y_idx.unique()[:n]
-        # cind_idxs = dd_df[dd_df.relation == "contraindication"].y_idx.unique()[:n]
         print("using ptrain")
         dd_df = TxData1.df_train
         ind_idx = dd_df[dd_df.relation == "indication"].y_idx.unique()[:10]
@@ -331,17 +226,11 @@ def generate_pseudo_labels(pre_trained_dir, size, seed, args, mode=None):
         ind_idx = dd_df[dd_df.relation == "indication"].y_idx.unique()
         cind_idxs = dd_df[dd_df.relation == "contraindication"].y_idx.unique() #### Test #### to check reproducibility of valid pseudo scores
         dd_df = dd_df[dd_df.relation.isin(["indication", "contraindication"])]
-    # elif generate_inog:
-    #     dd_df = TxData1.og_filtered_dd
-    #     ind_idx = dd_df[dd_df.relation == "indication"].y_idx.unique()
-    #     cind_idxs = dd_df[dd_df.relation == "contraindication"].y_idx.unique() #### Test #### to check reproducibility of valid pseudo scores
-    #     del dd_df
     elif args.exlucde_valid_test:
         df_train, df_valid, df_test, disease_idx = disease_idx_wout_val_test(seed, args)
         assert sum(df_train.x_idx - TxData1.df_train.x_idx) == 0, "split is somehow different"
         assert sum(df_valid.x_idx - TxData1.df_valid.x_idx) == 0, "split is somehow different"
         assert sum(df_test.x_idx - TxData1.df_test.x_idx) == 0 , "split is somehow different"
-        # low_disease_idx = obtain_disease_idx(TxData1=TxData1, deg=deg) ## turned off unless you set deg
         ind_idx = disease_idx
         cind_idxs = disease_idx
     else:
@@ -375,7 +264,6 @@ def generate_pseudo_labels(pre_trained_dir, size, seed, args, mode=None):
 
 
 def train_w_psuedo_labels(additional_train, pretrain_scores_dict, seed, save_dir, args, size=None, i=0):
-# def train_w_psuedo_labels(size=100, split='complex_disease', additional_train=None, create_psuedo_edges=False, seed=1, save_dir=None, dropout=0, reparam_mode=False, weight_decay=0, soft_psuedo=False):
     '''
         Takes in pretrained model and generate psuedo label? 
     '''
@@ -413,7 +301,6 @@ def train_w_psuedo_labels(additional_train, pretrain_scores_dict, seed, save_dir
                             dropout=dropout,
                             reparam_mode=reparam_mode if i != 0 or args.force_reparam else None,
                             kl = kl,
-                            # neg_pseudo_sampling = neg_pseudo_sampling,
                             LSP = LSP if i != 0 else None,
                             LSP_size=LSP_size if i != 0 else None,
                             args=args,)
@@ -421,10 +308,6 @@ def train_w_psuedo_labels(additional_train, pretrain_scores_dict, seed, save_dir
     # Train
     if args.debug:
         TxGNN1.print_model_size()
-        # TxGNN1.pretrain(n_epoch = 1, #---
-        #         learning_rate = 1e-3,
-        #         batch_size = 1024, 
-        #         train_print_per_n = 20)
         TxGNN1.finetune(n_epoch = 19, #---
                     learning_rate = 5e-4,
                     train_print_per_n = 5,
@@ -468,68 +351,3 @@ def train_w_psuedo_labels(additional_train, pretrain_scores_dict, seed, save_dir
             os.makedirs(save_dir)
         # noisy_student_fpath = './Noisy_student/'
         TxGNN1.save_model(path=save_dir)
-
-
-# def train_then_generate_psuedo_labels(split, size, seed, deg, k_top_candidates, least_score, save_name, mode):
-#     '''
-#         Loads a pre-trained model, calls (obtain_disease_idx, turn_into_dataframe) to generates psuedo_labels for diseases less than 'deg'. Returns dataframe ready to be augmented to df_train.
-#     '''
-#     strt = time.time()
-#     TxData1 = TxData(data_folder_path = './data/')
-#     TxData1.prepare_split(split=split, seed=seed, no_kg=False)
-#     low_disease_idx = obtain_disease_idx(TxData1=TxData1, deg=deg)
-
-#     txGNN = TxGNN(
-#                 data = TxData1, 
-#                 weight_bias_track = False,
-#                 proj_name = 'TxGNN',
-#                 exp_name = 'TxGNN'
-#             )
-        
-#     txGNN.model_initialize(n_hid = size, 
-#                             n_inp = size, 
-#                             n_out = size, 
-#                             proto = True,
-#                             proto_num = 3,
-#                             attention = False,
-#                             sim_measure = 'all_nodes_profile',
-#                             bert_measure = 'disease_name',
-#                             agg_measure = 'rarity',
-#                             num_walks = 200,
-#                             walk_mode = 'bit',
-#                             path_length = 2)
-#     # Train
-#     # txGNN.pretrain(n_epoch = 1, #---
-#     #                 learning_rate = 1e-3,
-#     #                 batch_size = 1024, 
-#     #                 train_print_per_n = 20)
-#     # # txGNN.finetune(n_epoch = 40, #---
-#     # txGNN.finetune(n_epoch = 500, #---
-#     #                 learning_rate = 5e-4,
-#     #                 train_print_per_n = 5,
-#     #                 valid_per_n = 20,)
-    
-#     if save_name is not None:
-#         noisy_student_fpath = './Noisy_student/'
-#         txGNN.save_model(path = noisy_student_fpath+'properly_pre_trained_model_ckpt/seed_1_restrained_saveG')
-    
-#     disease_idxs = low_disease_idx
-#     txEval = TxEval(model = txGNN)
-#     indication, contraindication = None, None
-#     if mode != "contraindication":
-#         indication = txEval.eval_disease_centric(disease_idxs = disease_idxs,
-#                                             relation = 'indication',
-#                                             save_name = None, 
-#                                             return_raw="concise",
-#                                             save_result = False)
-    
-#     if mode != "indication":
-#         contraindication = txEval.eval_disease_centric(disease_idxs = disease_idxs, 
-#                                             relation = 'contraindication',
-#                                             save_name = None, 
-#                                             return_raw="concise",
-#                                             save_result = False)
-#     # psuedo_training_df = turn_into_dataframe(results, t=k_top_candidates, least_score=least_score)
-#     psuedo_end = time.time() 
-#     print(f"time it took to generate psuedo_labels: {psuedo_end - strt}")
-#     return {'indication': indication, 'contraindication': contraindication}
