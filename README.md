@@ -12,7 +12,7 @@
 
 `pip install -r requirements.txt`
 
-3. Download Data
+3. Download Data (PrimeKG)
 
 `wget -O kg.csv https://dataverse.harvard.edu/api/access/datafile/6180620`
 
