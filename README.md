@@ -9,9 +9,12 @@ Dear visitors, we really appreciate your stars!
 
 ### How to replicate experiments:
 1. Install Environment
+
 `pip install -r requirements.txt`
-2. Download Data
+3. Download Data
+
 `wget -O kg.csv https://dataverse.harvard.edu/api/access/datafile/6180620`
-4. Run bash script
+5. Run bash script
+
 `. multiple_experiments.sh`
 
