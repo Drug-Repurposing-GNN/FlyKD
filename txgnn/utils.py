@@ -26,8 +26,6 @@ from zipfile import ZipFile
 import warnings
 warnings.filterwarnings("ignore")
 
-#device = torch.device("cuda:0")
-
 from .data_splits.datasplit import DataSplitter
 
 def dataverse_download(url, save_path):
@@ -170,9 +168,6 @@ def disease_eval_fold(df, fold_seed, disease_idx):
     df_valid = df_dd_val
     df_test = df_dd_test                               
                                    
-    #np.random.seed(fold_seed)
-    #np.random.shuffle(unique_diseases)
-    #train, valid = np.split(unique_diseases, int(0.95*len(unique_diseases)))
     return {'train': df_train.reset_index(drop = True), 
             'valid': df_valid.reset_index(drop = True), 
             'test': df_test.reset_index(drop = True)}                      
@@ -243,9 +238,10 @@ def create_split(df, split, disease_eval_index, split_data_path, seed):
     df_train = reverse_rel_generation(df, df_train, unique_rel)
     df_valid = reverse_rel_generation(df, df_valid, unique_rel)
     df_test = reverse_rel_generation(df, df_test, unique_rel)
-    df_train.to_csv(os.path.join(split_data_path, 'train.csv'), index = False)
-    df_valid.to_csv(os.path.join(split_data_path, 'valid.csv'), index = False)
-    df_test.to_csv(os.path.join(split_data_path, 'test.csv'), index = False)
+    if split_data_path is not None:
+        df_train.to_csv(os.path.join(split_data_path, 'train.csv'), index = False)
+        df_valid.to_csv(os.path.join(split_data_path, 'valid.csv'), index = False)
+        df_test.to_csv(os.path.join(split_data_path, 'test.csv'), index = False)
     
     return df_train, df_valid, df_test
     
@@ -351,9 +347,6 @@ class Full_Graph_NegSampler:
             temp = construct_negative_graph_each_etype(graph, self.k, etype, self.method, self.weights, self.device)
             if len(temp[etype][0]) != 0:
                 out.update(temp)
-            # else:
-            #     print(self.weights[('disease', 'rev_indication', 'drug')].sum())
-            
         return dgl.heterograph(out, num_nodes_dict={ntype: graph.number_of_nodes(ntype) for ntype in graph.ntypes})
         
 def evaluate_graph_construct(df_valid, g, neg_sampler, k, device):
@@ -440,14 +433,12 @@ def evaluate(model, valid_data, G):
 
 def obtain_LS_matrix(model, g_eval, G):
     ## On Train dataset for now? But we can also do it on validation and test split
-    # distmult = model.extract_distmult()
     with torch.no_grad():
         h, beta_kl_loss, distmult = model(G, pretrain_mode = False, mode = 'train', return_h_and_kl=True) 
         pseudo_pos_scores_rel, _, LS = distmult(g_eval, G, h, mode=None, pretrain_mode=False, pseudo_training=True, LSP=True)
     return LS
 
 def evaluate_accuracy_per_split(model, train_pos, train_neg, val_pos, val_neg, test_pos, test_neg, device=None):
-    # device = device if device is not None else torch.device("cuda")
     G = train_pos
     model.eval()
     def evalute_accuracy(g_pos, g_neg):
@@ -506,7 +497,6 @@ def evaluate_fb(model, g_pos, g_neg, G, dd_etypes, device, return_embed = False,
         neg_score = torch.cat([pred_score_neg[i] for i in dd_etypes])
         
         scores = torch.sigmoid(torch.cat((pos_score, neg_score)).reshape(-1,))
-        # labels = [1] * len(pos_score) + [0] * len(neg_score)
         labels = torch.cat((torch.ones(len(pos_score), device=device),
                             torch.zeros(len(neg_score), device=device)))
         loss = F.binary_cross_entropy(scores, labels)
@@ -594,10 +584,8 @@ def evaluate_graphmask(model, G, g_valid_pos, g_valid_neg, only_relation, epoch,
     else:
         return g_ + f_
     
-    ## I don't think evaluate_mb is used at all
 def evaluate_mb(model, g_pos, g_neg, G, dd_etypes, device, return_embed = False, mode = 'valid'):
     model.eval()
-    #model = model.to('cpu')
     pred_score_pos, pred_score_neg, pos_score, neg_score = model.forward_minibatch(g_pos.to(device), g_neg.to(device), [G.to(device), G.to(device)], G.to(device), mode = mode, pretrain_mode = False)
     
     pos_score = torch.cat([pred_score_pos[i] for i in dd_etypes])
@@ -1148,7 +1136,6 @@ def disease_centric_evaluation(df, df_train, df_valid, df_test, data_path, G, mo
     def get_scores_disease(rel, disease_ids, disable_dpm=False):
         df_train_valid = pd.concat([df_train, df_valid])
         df_dd = df_test[df_test.relation.isin(disease_rel_types)] ## filters df_test that has the relation of interest
-        # df_dd_all = pd.concat([df_train, df_valid, df_test]) ## 
         df_dd_train = df_train_valid[df_train_valid.relation.isin(disease_rel_types)]
 
         df_rel_dd = df_dd[df_dd.relation == rel][['x_idx', 'y_idx']] ## shrink down df
@@ -1185,7 +1172,6 @@ def disease_centric_evaluation(df, df_train, df_valid, df_test, data_path, G, mo
             src = torch.Tensor([disease_id] * len(labels)).to(device).to(dtype = torch.int64)
             dst = torch.Tensor(list(labels.keys())).to(device).to(dtype = torch.int64)
             out.update({('drug', rel, 'disease'): (dst, src)})
-            # out.update({('disease', rel, 'drug'): (src, dst)})
 
             g_eval = dgl.heterograph(out, num_nodes_dict={ntype: G.number_of_nodes(ntype) for ntype in G.ntypes}).to(device)
             
@@ -1194,100 +1180,17 @@ def disease_centric_evaluation(df, df_train, df_valid, df_test, data_path, G, mo
                 pred_score_rel, pred_score = distmult(g_eval, G, h, pretrain_mode=False, mode=None)
 
             pred = pred_score_rel[('drug', rel, 'disease')].reshape(-1,).detach().cpu().numpy()
-            # pred = pred_score_rel[('disease', rel, 'drug')].reshape(-1,).detach().cpu().numpy()
             lab = {idx2id_drug[i]: labels[i] for i in g_eval.edges()[0].detach().cpu().numpy()}
             preds_contra[idx2id_disease[disease_id]] = {idx2id_drug[i]: pred[idx] for idx, i in enumerate(g_eval.edges()[0].detach().cpu().numpy())}
             labels_contra[idx2id_disease[disease_id]] = lab
-            # ids_contra[idx2id_disease[disease_id]] = g_eval.edges()[1].detach().cpu().numpy()
 
             del pred_score_rel, pred_score
         return preds_contra, labels_contra, drug_nodes, [id2name_drug[idx2id_drug[i]] for i in drug_nodes]
     
-    # def get_all_scores_disease(rel, disease_ids):
-    #     df_train_valid = pd.concat([df_train, df_valid])
-    #     df_dd = df_test[df_test.relation.isin(disease_rel_types)] ## filters df_test that has the relation of interest
-    #     # df_dd_all = pd.concat([df_train, df_valid, df_test]) ## 
-    #     df_dd_train = df_train_valid[df_train_valid.relation.isin(disease_rel_types)]
-
-    #     df_rel_dd = df_dd[df_dd.relation == rel][['x_idx', 'y_idx']] ## shrink down df
-    #     df_rel_dd_train = df_dd_train[df_dd_train.relation == rel][['x_idx', 'y_idx']] ## shrink down df
-    #     drug_nodes = G.nodes('drug').cpu().numpy()
-    #     if disease_ids is None:
-    #         disease_ids = df_rel_dd.x_idx.unique()
-    #     preds_contra = {}
-    #     labels_contra = {}
-    #     ids_contra = {}
-
-    #     for disease_id in tqdm(disease_ids):
-
-    #         candidate_pos = df_rel_dd[df_rel_dd.x_idx == disease_id]#[['x_idx', 'y_idx']]
-    #         candidate_pos_train = df_rel_dd_train[df_rel_dd_train.x_idx == disease_id]
-    #         drug_pos = candidate_pos.y_idx.values
-    #         drug_pos_train_val = candidate_pos_train.y_idx.values
-
-    #         labels = {}
-    #         for i in drug_nodes:
-    #             if i in drug_pos:
-    #                 labels[i] = 1
-    #             elif i in drug_pos_train_val:
-    #                 labels[i] = -1
-    #                 # in the training set
-    #             else:
-    #                 labels[i] = 0
-
-    #         # construct eval graph
-    #         out = {}
-    #         src = torch.Tensor([disease_id] * len(labels)).to(device).to(dtype = torch.int64)
-    #         dst = torch.Tensor(list(labels.keys())).to(device).to(dtype = torch.int64)
-    #         out.update({('disease', rel, 'drug'): (src, dst)})
-
-    #         g_eval = dgl.heterograph(out, num_nodes_dict={ntype: G.number_of_nodes(ntype) for ntype in G.ntypes}).to(device)
-            
-    #         model.eval()
-    #         with torch.no_grad():
-    #             _, pred_score_rel, _, pred_score, _ = model(G, g_eval)
-    #         pred = pred_score_rel[('disease', rel, 'drug')].reshape(-1,).detach().cpu().numpy()
-    #         lab = {idx2id_drug[i]: labels[i] for i in g_eval.edges()[1].detach().cpu().numpy()}
-    #         preds_contra[idx2id_disease[disease_id]] = {idx2id_drug[i]: pred[idx] for idx, i in enumerate(g_eval.edges()[1].detach().cpu().numpy())}
-    #         labels_contra[idx2id_disease[disease_id]] = lab
-    #         # ids_contra[idx2id_disease[disease_id]] = g_eval.edges()[1].detach().cpu().numpy()
-
-    #         del pred_score_rel, pred_score
-    #     return preds_contra, labels_contra, drug_nodes, [id2name_drug[idx2id_drug[i]] for i in drug_nodes]
-    
     if return_raw == "concise":
-        ## the below was previously used to do inference on drugs only seen in the test set.
-
-        # temp_d, preds_all, labels_all, org_out_all, metrics_all, ranked_Ids, ranked_list, name, dis_id, dis_idx, ranked_Idxs, ranked_scores = {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
-        # rel_type = 'rev_' + relation ## why add rev_ ??
-        # preds_, labels_, drug_idxs, drug_names = get_scores_disease(rel_type, disease_ids)
-        # preds_all[rel_type] = preds_ ## Q. shouldn't the rel_type be in the dictionary as key then? A. No, because we are returning preds_all[relation]
-        # labels_all[rel_type] = labels_
-        # ids_all = list(preds_all[rel_type].keys())
-        # id2idx_disease = {id:idx for idx, id in idx2id_disease.items()}
-        # for entity_id in ids_all:
-        #     pred = preds_all[rel_type][entity_id]
-        #     lab = labels_all[rel_type][entity_id]
-        #     ids_rels = drug_ids_rels
-        #     fixed_keys = np.intersect1d(ids_rels[rel_type], [i for i,j in lab.items() if j != -1]) ## Q. What is label exactly and why take them out if it is -1? A. Intersection is a set operation. Taking out the -1 means that we only want to evalute drug nodes seen in test set with relation in interest.
-        #     idx2id = {idx: i for idx, i in enumerate(fixed_keys)}
-        #     pred_array = np.array([pred[i] for i in fixed_keys])
-        #     ranked_list_entity = np.argsort(pred_array)[::-1]
-        #     ranked_scores[entity_id] = pred_array[ranked_list_entity]
-        #     # ranked_list[entity_id] = [id2name_drug[idx2id[i]] for i in ranked_list_entity]
-        #     ranked_Idxs[entity_id] = ranked_list_entity
-        #     ranked_Ids[entity_id] = [idx2id[i] for i in ranked_list_entity]
-        #     # name[entity_id] = id2name_disease[entity_id]
-        #     dis_idx[entity_id] = id2idx_disease[entity_id]
-
-        # # out = {"entity_id": entity_id, "ranked_Ids": ranked_Ids, "ranked_Idxs": ranked_Idxs}
-        # out = {"dis_idx":dis_idx, "ranked_drug_ids": ranked_Ids, "ranked_drug_idxs": ranked_Idxs, "ranked_scores": ranked_scores}
-        # return out
-    
         temp_d, preds_all, labels_all, org_out_all, metrics_all, ranked_Ids, ranked_list, name, dis_id, dis_idx, ranked_Idxs, ranked_scores = {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
-        # rel_type = 'rev_' + relation ## Q. why add rev_ ??
-        rel_type = relation ## Q. why add rev_ ??
-        preds_, labels_, drug_idxs, drug_names = get_scores_disease(rel_type, disease_ids, disable_dpm=False) ## Think we still need dpm? Can also try without it and see if pseudo labels can replace them. 
+        rel_type = relation
+        preds_, labels_, drug_idxs, drug_names = get_scores_disease(rel_type, disease_ids, disable_dpm=False) 
         preds_all[rel_type] = preds_ ## Q. shouldn't the rel_type be in the dictionary as key then? A. No, because we are returning preds_all[relation] not preds_all
         labels_all[rel_type] = labels_
         ids_all = list(preds_all[rel_type].keys())
@@ -1304,28 +1207,12 @@ def disease_centric_evaluation(df, df_train, df_valid, df_test, data_path, G, mo
             ranked_Idxs[entity_id] = ranked_list_entity
 
             ranked_Ids[entity_id] = [id2idx[i] for i in ranked_list_entity]
-            # name[entity_id] = id2name_disease[entity_id]
             dis_idx[entity_id] = id2idx_disease[entity_id] ## the original implementation flipped id and idx? 
-
-        #     ## Let's create a dataframe for each disease and concatenate it
-        #     print(len(ranked_scores[entity_id]), len(ranked_Idxs[entity_id]), len(ranked_Ids[entity_id]))
-        #     n = len(ranked_scores[entity_id])
-        #     broadcasted_y_id = [entity_id] * n
-        #     broadcasted_y_idx = [dis_idx] * n
-        #     broadcasted_relation = [relation] * n
-        #     tempt_df = pd.DataFrame({'y_id': broadcasted_y_id, 'y_idx': broadcasted_y_idx, 'relation': broadcasted_relation, 'x_id': ranked_Ids[entity_id], 'x_idx': ranked_Idxs[entity_id], 'score': ranked_scores[entity_id]})
-        #     # 1, 1, 1, n, n, n
-        #     concat_dfs.append(tempt_df)
-        # out_df = pd.concat(concat_dfs, ignore_index=True)
-
         out = {"dis_idx":dis_idx, "ranked_drug_ids": ranked_Ids, "ranked_drug_idxs": ranked_Idxs, "ranked_scores": ranked_scores}
-        # return out_df
         return out
-        # return "let's seed the speed"
 
     if disease_ids is None:
         # downstream evaluate all test set diseases
-        
         temp_d, preds_all, labels_all, org_out_all, metrics_all = {}, {}, {}, {}, {}
 
         for rel_type in disease_rel_types:

@@ -103,7 +103,7 @@ class DistMultPredictor(nn.Module):
             etypes = self.disease_etypes_all #if LSP_size else self.etypes_dd
             all_disease_ids = torch.arange(G.num_nodes("disease"))
             path = f"./data/{split}_{seed}"
-            if os.path.exists(f"{path}/sim_all_etypes.pkl"):
+            if os.path.exists(f"{path}/sim_all_etypes.pkl") and os.path.exists(f"{path}/diseaseid2id_etypes.pkl") and os.path.exists(f"{path}/diseases_profile_etypes.pkl"):
                 with open(f"{path}/sim_all_etypes.pkl", "rb") as file:
                     self.sim_all_etypes = pickle.load(file)
                 with open(f"{path}/diseaseid2id_etypes.pkl", "rb") as file2:
@@ -159,7 +159,7 @@ class DistMultPredictor(nn.Module):
         score = torch.sum(h_u * h_r * h_v, dim=1)
         return {'score': score}
 
-    def compute_local_structure_vectors(self, graph, sparse_LS_list, etype, LSP):
+    def compute_local_structure_vectors(self, graph, sparse_LS_list, etype, LSP, sigma):
         # h = graph.ndata['h']
         if LSP == "cosine":
             f_sim = torch.nn.CosineSimilarity(dim=1)
@@ -168,7 +168,8 @@ class DistMultPredictor(nn.Module):
         elif LSP == "Poly":
             f_sim = lambda src, dst: (torch.dot(src, dst) + 2)**2
         elif LSP == "RBF":
-            f_sim = lambda src, dst: torch.exp(-0.5 * ((src - dst).norm(p=2, dim=1)**2))
+            assert sigma is not None
+            f_sim = lambda src, dst: torch.exp(-((src - dst).norm(p=2, dim=1)**2) / (2 * sigma ** 2))
         # elif sim == "L2":
         #     f_sim = torch.nn.CosineSimilarity(dim=1)
         # elif sim == "L2":
@@ -224,7 +225,7 @@ class DistMultPredictor(nn.Module):
         # print(f"appending vector to LS dictionary {time.time() - strt}")
 
     ## pseudo_training disabled dpm
-    def forward(self, graph, G, h, pretrain_mode, mode, block = None, only_relation = None, pseudo_training=False, LSP=False, LSP_size=None):
+    def forward(self, graph, G, h, pretrain_mode, mode, block = None, only_relation = None, keep_grad_for_sl=False, LSP=False, LSP_size=None, sigma=None, verbose=False):
         with graph.local_scope():
             scores = {}
             s_l = []
@@ -278,25 +279,8 @@ class DistMultPredictor(nn.Module):
                     ## Create a LS dictionary (w/ LS vectors) that will get updated every etype iteration
                     ## contains ingrediants to concatenate to create a final sparse LS tensor which will be compressed during loss computation.
                     sparse_LS_list = [] 
-                    # disease_nodes = graph.nodes("disease")
-                    # n_dis = G.num_nodes("disease")
-                    # n_max = max([max(G.num_nodes(src), G.num_nodes(dst)) for src, _, dst in etypes]) 
-                    # LS = torch.sparse_coo_tensor(torch.empty((2, 0)), torch.empty(0), (n_dis, n_max), device=self.device) ## [N, N, E]
-                    # LS = torch.zeros(n_dis, n_max, len(etypes), device=self.device) ## [N, N, E]
-                    # LS = [[] for node in disease_nodes]
-                    # LS = {node.item(): [] for node in disease_nodes}
-                # etypes_strt = time.time()
                 for i, etype in enumerate(etypes):
-                    # if LSP:
-                        # if etype[1] == "indication":
-                        #     graph_src, graph_dst = graph.edges(etype)
-                        # for dst in graph_dst:
-                        #     if dst not in self.diseaseid2id_etypes[etype].keys():
-                        #         print("so it shouldn't work right? ")
-                        #         raise KeyError
-
-                    if self.proto: #### TESTING #### PSEUDO TRAINIGN W/ DPM (ONLY UTILIZING TRAIN PSEUDO SCORES)
-                    # if not pseudo_training and self.proto:
+                    if self.proto: 
                         src, dst = etype[0], etype[2]
                         # ## Eval g's embeddings in etype
                         src_rel_idx = torch.where(graph.out_degrees(etype=etype) != 0)
@@ -329,7 +313,8 @@ class DistMultPredictor(nn.Module):
                                 sim = self.sim_all_etypes[etype][np.array([self.diseaseid2id_etypes[etype][i.item()] for i in h_disease['disease_query_id'][0]])]
                                 ## Pruning of sim matrix where we do not consider nodes without this relation (prevents index error later)
                                 sim = sim[:, h_disease['disease_key_id'][0].cpu()].to(self.device)
-                                print(f"Using stored similarity matrix for {etype}")
+                                if verbose:
+                                    print(f"Using stored similarity matrix for {etype}")
                             except:
                                 print(f"Computing similarity matrix for out of distribution data for {etype}")
                                 
@@ -358,9 +343,6 @@ class DistMultPredictor(nn.Module):
 
                                 sim = sim_matrix(profile_query, profile_keys)
 
-                            # if src_h.shape[0] == src_h_keys.shape[0]:
-                                ## during training...
-
                             # masking of whether eval_g's node is seen in the Train_G
                             mask = torch.isin(h_disease['disease_query_id'][0], h_disease['disease_key_id'][0])
 
@@ -373,40 +355,11 @@ class DistMultPredictor(nn.Module):
                                 topk_values, topk_indices = torch.topk(sim[seen], self.k + 1, dim=1)
                                 coef[seen, :] = F.normalize(topk_values[:, 1:], p=1, dim=1)
                                 embed[seen] = h_disease['disease_key'][topk_indices[:, 1:]]
-
-                            # try: 
                             unseen = (~mask).nonzero().squeeze(dim=-1)
                             if len(unseen) > 0:
                                 topk_values, topk_indices = torch.topk(sim[unseen], self.k, dim=1)
                                 coef[unseen, :] = F.normalize(topk_values, p=1, dim=1)
                                 embed[unseen] = h_disease['disease_key'][topk_indices]
-
-                            # print("Does this slick trick work? ")
-                            # topk_values, topk_indices = torch.topk(sim, self.k, dim=1)
-                            # coef = F.normalize(topk_values, p=1, dim=1) 
-                            # embed = h_disease['disease_key'][topk_indices]
-
-                            # print(seen.shape)
-                            # print(seen)
-                            # except Exception as e:
-                            # print(f"excpetion: {e}")
-                            # print(mask)
-                            # print(seen)
-                            # print(unseen)
-                            # print(h_disease['disease_query_id'][0].shape)
-                            # print(h_disease['disease_key_id'][0].shape)
-                            # coef = torch.topk(sim, self.k + 1).values[:, 1:]
-                            # coef = F.normalize(coef, p=1, dim=1)
-                            # embed = h_disease['disease_key'][torch.topk(sim, self.k + 1).indices[:, 1:]]
-
-                            # else:
-                            #     ## during evaluation...
-                            #     coef = torch.topk(sim, self.k).values[:, :]
-                            #     coef = F.normalize(coef, p=1, dim=1)
-                                # embed = h_disease['disease_key'][torch.topk(sim, self.k).indices[:, :]]
-
-                            ## embed [N, k, F]
-                            ## coef [N, k]
                             out = torch.mul(embed, coef.unsqueeze(dim = 2).to(self.device)).sum(dim = 1)
 
                         if self.sim_measure in ['protein_profile', 'all_nodes_profile', 'protein_random_walk', 'bert', 'profile+bert']:
@@ -455,7 +408,7 @@ class DistMultPredictor(nn.Module):
                         graph.ndata['h'] = h
 
                     if LSP:
-                        self.compute_local_structure_vectors(graph, sparse_LS_list, etype, LSP=LSP)
+                        self.compute_local_structure_vectors(graph, sparse_LS_list, etype, LSP=LSP, sigma=sigma)
                     
                     if etype in self.restrained_dd_etypes:
                         graph.apply_edges(self.apply_edges, etype=etype)
@@ -466,19 +419,12 @@ class DistMultPredictor(nn.Module):
                         scores[etype] = out
                         scores[f"{etype}_srcdst"] = srcdst
 
-                    if self.proto: #### TESTING #### PSEUDO TRAINIGN W/ DPM (ONLY UTILIZING TRAIN PSEUDO SCORES)
-                    # if not pseudo_training and self.proto:
+                    if self.proto: 
                         # recover back to the original embeddings for other relations
                         h[src][src_rel_idx] = src_h
                         h[dst][dst_rel_idx] = dst_h
-                # print(f"etypes for loop time taken: {time.time() - etypes_strt}")
 
             if LSP:  
-                # print("worked until here")
-                # LS = LS.sum(dim=-1)
-                # for i, v in enumerate(LS):
-                #     if len(v) > 0:
-                #         LS[i] = torch.cat(v)
                 strt = time.time()
                 final_indices = []
                 final_values = []
@@ -489,8 +435,6 @@ class DistMultPredictor(nn.Module):
                     final_indices.append(pad_indices)
                     final_values.append(values)
                     indices_cursor += max_node
-
-                
                 final_indices = torch.cat(final_indices, dim=-1)
                 final_values = torch.cat(final_values)
 
@@ -499,11 +443,10 @@ class DistMultPredictor(nn.Module):
                     ## masking of row indices
                     mask = final_indices[0] == i
                     LS.append(final_values[mask])
-                # LS = torch.sparse_coo_tensor(final_indices, final_values, (G.num_nodes("disease"), indices_cursor))
                 print(f"time it took to create the sparse tensor: {time.time() - strt}")
                 return scores, s_l, LS
             
-            if pretrain_mode or pseudo_training:
+            if pretrain_mode or keep_grad_for_sl:
                 if len(s_l) > 0:
                     s_l = torch.cat(s_l)           
                 else:
@@ -512,7 +455,6 @@ class DistMultPredictor(nn.Module):
                 s_l = torch.cat(s_l).reshape(-1,).detach().cpu().numpy()
 
             return scores, s_l
-
 
     
 class AttHeteroRGCNLayer(nn.Module):
@@ -613,9 +555,6 @@ class HeteroRGCNLayer(nn.Module):
                 gate, penalty, gate_score, penalty_not_sum = self.gate[etype][self.layer]([edges.src['Wh_%s' % etype], edges.dst['Wh_%s' % etype[4:]]])
             else:
                 gate, penalty, gate_score, penalty_not_sum = self.gate[etype][self.layer]([edges.src['Wh_%s' % etype], edges.dst['Wh_%s' % 'rev_' + etype]])
-                
-        #self.penalty += len(edges.src['Wh_%s' % etype])/self.num_of_edges * penalty
-        #self.penalty += penalty
         self.penalty.append(penalty)
         
         self.num_masked += len(torch.where(gate.reshape(-1) != 1)[0])
@@ -630,7 +569,6 @@ class HeteroRGCNLayer(nn.Module):
     
     def message_func_no_replace(self, edges):
         etype = edges._etype[1]
-        #self.msg_emb[etype] = edges.src['Wh_%s' % etype].to('cpu')
         return {'m': edges.src['Wh_%s' % etype]}
     
     def graphmask_forward(self, G, feat_dict, graphmask_mode, return_gates):
@@ -660,9 +598,6 @@ class HeteroRGCNLayer(nn.Module):
         
         if graphmask_mode:
             self.penalty = torch.stack(self.penalty).reshape(-1,)
-            #penalty_mean = torch.mean(self.penalty)
-            #penalty_relation_reg = torch.sum(torch.log(self.penalty) * self.penalty)
-            #penalty = penalty_mean + 0.1 * penalty_relation_reg
             penalty = torch.mean(self.penalty)
         else:
             penalty = 0 
@@ -737,16 +672,15 @@ class HeteroRGCN(nn.Module):
         total_kl_div = 0
         MAX_LOGSTD = 10
         for key in mu_dict.keys():
-            mu = mu_dict[key].clone() ### solving gradient in-place operation error/ 
+            mu = mu_dict[key].clone() ### solving gradient in-place operation error. Gradient still flows thorugh. 
             logstd = logstd_dict[key].clamp(max=MAX_LOGSTD)
-            # mu_squared = mu ** 2
-            # logstd_squared = logstd ** 2
             kl_div = - 0.5 * torch.mean(torch.sum(1 + 2 * logstd - mu**2 - logstd.exp()**2, dim=1))
             total_kl_div += kl_div
         return total_kl_div
     
     def reparameterize(self, mean_dict, logvar_dict, train=False):
         if train: ## add noise
+            print("Using reparamerization trick in training mode")
             z_dict = {}
             for ntype in mean_dict:
                 std = torch.exp(0.5 * logvar_dict[ntype])
@@ -754,9 +688,6 @@ class HeteroRGCN(nn.Module):
                 z_dict[ntype] = mean_dict[ntype] + std * eps
             return z_dict
         else:
-            # for ntype in mean_dict:
-            #     z_dict[ntype] = mean_dict[ntype]
-            # return z_dict
             return mean_dict ## doing the same as above code? 
         
     def forward_minibatch(self, pos_G, neg_G, blocks, G, mode = 'train', pretrain_mode = False):
@@ -790,7 +721,7 @@ class HeteroRGCN(nn.Module):
         return scores, scores_neg, out_pos, out_neg, beta_kl_loss
         
     
-    def forward(self, G, neg_G = None, eval_pos_G = None, return_h = False, return_att = False, mode = 'train', pretrain_mode = False, pseudo_training=False, return_h_and_kl=False):
+    def forward(self, G, neg_G = None, eval_pos_G = None, return_h = False, return_att = False, mode = 'train', pretrain_mode = False, pseudo_training=False, return_h_and_kl=False, return_all_layer_h=False):
         with G.local_scope():
             input_dict = {ntype : G.nodes[ntype].data['inp'] for ntype in G.ntypes}
 
@@ -800,10 +731,12 @@ class HeteroRGCN(nn.Module):
                 h, a_dict_l2 = self.layer2(G, h_dict, return_att)
             else:
                 h_dict = self.layer1(G, input_dict)
-                if self.dropout:
-                    h_dict = {k : F.dropout(F.leaky_relu(h), p=0.1) for k, h in h_dict.items()}
+                if self.dropout != 0:
+                    print(f"dropout being applied {self.dropout}")
+                    h_dict = {k : F.dropout(F.leaky_relu(h), p=self.dropout) for k, h in h_dict.items()}
                 else:
                     h_dict = {k : F.leaky_relu(h) for k, h in h_dict.items()}
+                h_inter = {k:v.clone() for k, v in h_dict.items()}
 
                 ## three versions of reparameterization. Only MPNN reparam utilizes layer 2 differently
                 beta_kl_loss = 0
@@ -823,14 +756,18 @@ class HeteroRGCN(nn.Module):
                         for ntype in h:
                             mean_dict[ntype] = self.mlp_mean[ntype](h[ntype])
                             logvar_dict[ntype] = self.mlp_logvar[ntype](h[ntype])
-                    h = self.reparameterize(mean_dict, logvar_dict, eval_pos_G is not None and self.training) ## turned off during eval
+                    h = self.reparameterize(mean_dict, logvar_dict, eval_pos_G is None and self.training) ## turned off during eval
                     beta_kl_loss = self.total_kl_loss(mean_dict, logvar_dict) / self.total_nodes
                     
-            if return_h:
-                return h
+            
+            if return_all_layer_h and return_h_and_kl:
+                return h_inter, h, beta_kl_loss, self.pred
             
             if return_h_and_kl:
                 return h, beta_kl_loss, self.pred
+            
+            if return_h:
+                return h
 
             if return_att:
                 return a_dict_l1, a_dict_l2
@@ -838,16 +775,12 @@ class HeteroRGCN(nn.Module):
             # full batch
             if eval_pos_G is not None:
                 # eval mode
-                scores, out_pos = self.pred(eval_pos_G, G, h, pretrain_mode, mode = mode + '_pos', pseudo_training=pseudo_training)
-                scores_neg, out_neg = self.pred(neg_G, G, h, pretrain_mode, mode = mode + '_neg', pseudo_training=pseudo_training)
+                scores, out_pos = self.pred(eval_pos_G, G, h, pretrain_mode, mode = mode + '_pos', keep_grad_for_sl=pseudo_training)
+                scores_neg, out_neg = self.pred(neg_G, G, h, pretrain_mode, mode = mode + '_neg', keep_grad_for_sl=pseudo_training)
                 return scores, scores_neg, out_pos, out_neg, beta_kl_loss
-            # elif psuedo: ## useful for only producing the relation score on neg_G (but doesn't necessarily have to be neg G)
-            #     scores, out_pos = self.pred(G, G, h, pretrain_mode, mode = mode + '_pos')
-            #     scores_neg, out_neg = self.pred(neg_G, G, h, pretrain_mode, mode = mode + '_neg', psuedo=True)
-            #     return scores, scores_neg, out_pos, out_neg, beta_kl_loss
             else:
-                scores, out_pos = self.pred(G, G, h, pretrain_mode, mode = mode + '_pos', pseudo_training=pseudo_training)
-                scores_neg, out_neg = self.pred(neg_G, G, h, pretrain_mode, mode = mode + '_neg', pseudo_training=pseudo_training)
+                scores, out_pos = self.pred(G, G, h, pretrain_mode, mode = mode + '_pos', keep_grad_for_sl=pseudo_training)
+                scores_neg, out_neg = self.pred(neg_G, G, h, pretrain_mode, mode = mode + '_neg', keep_grad_for_sl=pseudo_training)
                 return scores, scores_neg, out_pos, out_neg, beta_kl_loss
     
     def graphmask_forward(self, G, pos_graph, neg_graph, graphmask_mode = False, return_gates = False, only_relation = None):
@@ -861,7 +794,6 @@ class HeteroRGCN(nn.Module):
             scores_neg, out_neg = self.pred(neg_graph, G, h, False, mode = 'train_neg', only_relation = only_relation)
             return scores_pos, scores_neg, penalty_l1 + penalty_l2, [num_masked_l1, num_masked_l2]
 
-    
     def enable_layer(self, layer):
         print("Enabling layer "+str(layer))
         
@@ -870,7 +802,6 @@ class HeteroRGCN(nn.Module):
                 parameter.requires_grad = True
 
             self.baselines_all[name][layer].requires_grad = True
-    
     
     def count_layers(self):
         return 2
@@ -891,7 +822,6 @@ class HeteroRGCN(nn.Module):
         
         for name in G.etypes:
             ## for each relation type
-
             gates = []
             baselines = []
 

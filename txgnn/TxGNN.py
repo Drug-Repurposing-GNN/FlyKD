@@ -31,7 +31,6 @@ import warnings
 warnings.filterwarnings("ignore")
 
 torch.manual_seed(0)
-#device = torch.device("cuda:0")
 
 class TxGNN:
     
@@ -46,18 +45,16 @@ class TxGNN:
         self.weight_bias_track = weight_bias_track
         self.G = data.G
         self.df, self.df_train, self.df_valid, self.df_test = data.df, data.df_train, data.df_valid, data.df_test
+        self.data = data
         self.data_folder = data.data_folder
         self.disease_eval_idx = data.disease_eval_idx
         self.split = data.split
         self.no_kg = data.no_kg
-        # self.kg_all = data.kg_all.to(device)
-        # self.kg_nc = data.kg_nc.to(device)
         self.g_pos_pseudo = data.g_pos_pseudo.to(device) if data.g_pos_pseudo is not None else None ## positive psuedo graph (ind, c-ind graph, w/ revs)
-        self.g_pos_dd = data.g_pos_dd
+        self.g_dd_train = data.g_dd_train
         self.pseudo_dd_etypes = [('drug', 'contraindication', 'disease'), 
                                 ('drug', 'indication', 'disease'), ]
-                                # ('disease', 'rev_contraindication', 'drug'), 
-                                # ('disease', 'rev_indication', 'drug'),]
+        self.MAX_LSP_LEN = None
         self.T = T
         self.seed = data.seed
         self.use_og = use_og
@@ -67,22 +64,15 @@ class TxGNN:
             ## compute and store pseudo probabilities to use as labels
             soft_psuedo_logits = torch.cat([soft_psuedo_logits_rel[i] for i in self.pseudo_dd_etypes])
             self.soft_psuedo_prob = torch.sigmoid(soft_psuedo_logits / T)
-
-            ## sanity check for correspondence between labels and edges, you can compare with DistMult src, dst edges. 
-            # print(self.g_pos_pseudo.edges(etype='indication'))
         else:
             self.soft_psuedo_prob = None
-
+        self.OC = self.df_train[self.df_train.relation == "contraindication"].shape[0]
+        self.OI = self.df_train[self.df_train.relation == "indication"].shape[0]
         self.disease_rel_types = ['rev_contraindication', 'rev_indication', 'rev_off-label use']
         
         self.dd_etypes = [('drug', 'contraindication', 'disease'), 
                         ('drug', 'indication', 'disease'), 
                         ]
-                    #   ('drug', 'off-label use', 'disease'),
-                    #   ('disease', 'rev_contraindication', 'drug'), 
-                    #   ('disease', 'rev_indication', 'drug'), 
-                    #   ('disease', 'rev_off-label use', 'drug')]
-
         if self.weight_bias_track:
             import wandb
             wandb.init(project=proj_name, name=exp_name)  
@@ -107,51 +97,26 @@ class TxGNN:
                                dropout = False,
                                reparam_mode=False,
                                kl = False,
-                               debug = False,
-                               neg_pseudo_sampling = False,
-                               LSP = False,
-                               LSP_size="full",):
+                               LSP = None,
+                               LSP_size="full",
+                               args=None):
         
         if self.no_kg and proto:
             print('Ablation study on No-KG. No proto learning is used...')
             proto = False
-        self.neg_pseudo_sampling = neg_pseudo_sampling
         self.kl = kl
         self.LSP = LSP
         self.LS_target = None
         if LSP is not None:
+            if args is None:
+                raise ValueError("args is missing")
             self.LSP = LSP
             self.LSP_size = LSP_size
-
-            if LSP == "cosine":
-                if LSP_size=="full" :
-                    self.LS_target = torch.load("LSP_full_cosine.pt")
-                elif LSP_size=="partial":
-                    self.LS_target = torch.load("LSP_partial_cosine.pt")
-                else:
-                    raise KeyError
-            elif LSP == "L2":
-                if LSP_size=="full" :
-                    self.LS_target = torch.load("LSP_full_L2.pt")
-                elif LSP_size=="partial":
-                    self.LS_target = torch.load("LSP_partial_L2.pt")
-                else:
-                    raise KeyError
-            elif LSP == "Poly":
-                raise KeyError ## not available yet
-                if LSP_size=="full" :
-                    self.LS_target = torch.load("LSP_full_L2.pt")
-                elif LSP_size=="partial":
-                    self.LS_target = torch.load("LSP_partial_L2.pt")
-                else:
-                    raise KeyError
-            elif LSP == "RBF":
-                if LSP_size=="full" :
-                    self.LS_target = torch.load("LSP_full_RBF.pt")
-                elif LSP_size=="partial":
-                    self.LS_target = torch.load("LSP_partial_RBF.pt")
-                else:
-                    raise KeyError
+            double = f"_double" if args.all_layers_LSP else ""
+            LSP_fname = f"LSP_{args.teacher_size}{double}_{self.seed}_{LSP_size}_{LSP}.pt"
+            print(f"Loading saved LSP tensors from: {LSP_fname}")
+            self.LS_target = torch.load(LSP_fname)
+        self.pretrain_scores_dict = args.pretrain_scores_dict if args is not None else None
 
         self.G = self.G.to('cpu')
         self.G = initialize_node_embedding(self.G, n_inp)
@@ -169,10 +134,15 @@ class TxGNN:
                     'agg_measure': agg_measure,
                     'num_walks': num_walks,
                     'walk_mode': walk_mode,
-                    'path_length': path_length
+                    'path_length': path_length,
+                    "dropout": dropout,
+                    "reparam_mode": reparam_mode,
+                    "kl": kl,
+                    "LSP": LSP,
+                    "LSP_size": "LSP_size",
+                    "args": args
                     }
         self.model = HeteroRGCN(self.G,
-        # self.model = HeteroRGCN(self.kg_nc, #### TESTING #### Would this speed unseen DPM much faster without compromising performance?
                 in_size=n_inp,
                 hidden_size=n_hid,
                 out_size=n_out,
@@ -195,7 +165,23 @@ class TxGNN:
                 ).to(self.device)    
         self.best_model = self.model
         self.best_G = self.G ## to store best validation's Graph Embedding
+        self.teacher_model = None
+        self.teacher_G = None
+        self.args = args
+        if args is not None and args.on_the_fly_KD and args.i != 0:
+            teacher_txgnn = TxGNN(
+                data = self.data, 
+            )
+            teacher_txgnn.load_pretrained(args.prev_trained_dir)
+            self.teacher_G = teacher_txgnn.best_G
+            self.teacher_model = teacher_txgnn.best_model
+            self.teacher_model.eval()
         
+    def print_model_size(self,):
+        if self.teacher_model is not None:
+            print(f"#param teacher model: {sum([p.numel() for p in self.teacher_model.parameters()])}")
+        print('#Param student model: %d' % (get_n_params(self.model)))
+    
     def pretrain(self, n_epoch = 1, learning_rate = 1e-3, batch_size = 1024, train_print_per_n = 20, sweep_wandb = None):
         
         if self.no_kg:
@@ -205,8 +191,14 @@ class TxGNN:
         print('Creating minibatch pretraining dataloader...')
         train_eid_dict = {etype: self.G.edges(form = 'eid', etype =  etype) for etype in self.G.canonical_etypes}
         sampler = dgl.dataloading.MultiLayerFullNeighborSampler(2)
+        ## inject pseudo labels as edge data
+        self.pretrain_G = copy.deepcopy(self.G)
+        if self.pretrain_scores_dict is not None: 
+            for full_etype in self.pretrain_G.canonical_etypes:
+                etype = full_etype[1]
+                self.pretrain_G.edges[etype].data["score"] = self.pretrain_scores_dict[full_etype].to(torch.device("cpu")).detach()
         dataloader = dgl.dataloading.EdgeDataLoader(
-            self.G, train_eid_dict, sampler,
+            self.pretrain_G, train_eid_dict, sampler,
             negative_sampler=Minibatch_NegSampler(self.G, 1, 'fix_dst'),
             batch_size=batch_size,
             shuffle=True,
@@ -218,6 +210,7 @@ class TxGNN:
         print('Start pre-training with #param: %d' % (get_n_params(self.model)))
 
         for epoch in range(n_epoch):
+            self.model.train()
             strt = time.time()
             for step, (nodes, pos_g, neg_g, blocks) in enumerate(dataloader):
 
@@ -226,18 +219,22 @@ class TxGNN:
                 neg_g = neg_g.to(self.device)
 
                 pred_score_pos, pred_score_neg, pos_score, neg_score, beta_kl_loss = self.model.forward_minibatch(pos_g, neg_g, blocks, self.G, mode = 'train', pretrain_mode = True)
-                ## I assume the above code does a neighborhood sampling and uses those edges to compute the loss. How could we reimplement this so that we can have labels but not edges? 
-                # print(f"blocks: {blocks}")
-                # print(f"pred_score_pos: {pred_score_pos}")
-                # print(f"pred_score_neg: {pred_score_neg}")
-                # print(f"pos_score: {pos_score}")
-                # print(f"neg_score: {neg_score}")
-                # break
 
                 scores = torch.cat((pos_score, neg_score)).reshape(-1,)
                 labels = [1] * len(pos_score) + [0] * len(neg_score)
-
                 loss = F.binary_cross_entropy(scores, torch.Tensor(labels).float().to(self.device)) + beta_kl_loss
+
+                if self.pretrain_scores_dict is not None:
+                    pseudo_labels_pretrain = pos_g.edata["score"]
+                    non_empty_pseudo_labels_pretrain = {k: v for k, v in pseudo_labels_pretrain.items() if v.numel() > 0}
+                    for (k1, pl), (k2, ps) in zip(non_empty_pseudo_labels_pretrain.items(), pred_score_pos.items()):
+                        ## checking dimensions
+                        assert pl.shape == ps.shape, f"pseudo label and scores have different values {k1}: {pl.shape}, {k2}: {ps.shape}. Perhaps, the order is messed up?"
+                    pseudo_labels_pretrain = torch.cat([v for v in pseudo_labels_pretrain.values()])
+                    pseudo_loss_pretrain = F.binary_cross_entropy(pos_score, pseudo_labels_pretrain.float().to(self.device))
+                    print(f"regular_loss: {loss}, pseudo_loss: {pseudo_loss_pretrain}")
+                    loss = loss * 0.05 + pseudo_loss_pretrain 
+
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
@@ -247,6 +244,7 @@ class TxGNN:
 
                 if step % train_print_per_n == 0:
                     # pretraining tracking...
+                    self.model.eval()
                     auroc_rel, auprc_rel, micro_auroc, micro_auprc, macro_auroc, macro_auprc = get_all_metrics_fb(pred_score_pos, pred_score_neg, scores.reshape(-1,).detach().cpu().numpy(), labels, self.G, True)
                     
                     if self.weight_bias_track:
@@ -274,6 +272,7 @@ class TxGNN:
                         macro_auprc
                     ))
         self.best_model = copy.deepcopy(self.model)
+        del self.pretrain_G
         
     def finetune(self, n_epoch = 500, 
                        learning_rate = 1e-3, 
@@ -282,169 +281,374 @@ class TxGNN:
                        sweep_wandb = None,
                        save_name = None,
                        weight_decay = 0,
-                       no_dpm = False):
-        
+                       no_dpm = False,
+                       args=None):
         best_val_acc = 0
 
         self.G = self.G.to(self.device)
         
         # neg_sampler = Full_Graph_NegSampler(self.G, 1, 'fix_dst', self.device)
-        neg_sampler = Full_Graph_NegSampler(self.g_pos_dd, 1, 'fix_dst', self.device)
-        if self.g_pos_pseudo is not None:
-            # pseudo_neg_sampler = Full_Graph_NegSampler(self.g_pos_pseudo, 1, 'fix_dst', self.device)
-            pseudo_neg_sampler = Full_Graph_NegSampler(self.g_pos_dd, 1, 'fix_dst', self.device)
+        neg_sampler = Full_Graph_NegSampler(self.g_dd_train, 1, 'fix_dst', self.device)
+        if args.neg_pseudo_sampling:
+            pseudo_neg_sampler = Full_Graph_NegSampler(self.g_pos_pseudo, 1, 'fix_dst', self.device)
+        elif args.limited_neg_pseudo_sampling:
+            pseudo_neg_sampler = Full_Graph_NegSampler(self.g_dd_train, 1, 'fix_dst', self.device)
+        if args.strong_scores is not None:
+            if args.fly_no_val_test:
+                fly_kd_neg_sampler = Full_Graph_NegSampler(self.G, 1, 'fix_dst', self.device)
+            else:
+                fly_kd_neg_sampler = Full_Graph_NegSampler(self.data.full_G, 1, 'fix_dst', self.device)
+            # fly_kd_neg_sampler = Full_Graph_NegSampler(g_on_the_fly, 1, 'fix_dst', self.device)
         torch.nn.init.xavier_uniform(self.model.w_rels) # reinitialize decoder
         
         optimizer = torch.optim.AdamW(self.model.parameters(), lr = learning_rate, weight_decay=weight_decay)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', 0.95)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', 0.90)
         
         strt = time.time()
         for epoch in range(n_epoch):
+            self.model.train()
+            verbose = epoch <= 20
             if epoch == 0:
                 print("first epoch initiating")
-            negative_graph = neg_sampler(self.G)
-            # pred_score_pos, pred_score_neg, pos_score, neg_score, beta_kl_loss = self.model(self.G, negative_graph, pretrain_mode = False, mode = 'train')
+            negative_graph = neg_sampler(self.g_dd_train)
 
             ## extracting h to use in the following auxillary loss for psuedo labels
             strt = time.time()
-            h, beta_kl_loss, distmult = self.model(self.G, negative_graph, pretrain_mode = False, mode = 'train', return_h_and_kl=True) 
-            pred_score_pos, _ = distmult(self.G, self.G, h, pretrain_mode=False, mode='train_pos') ## Mystery No.2, why did psuedo=True cause error? 
-            pred_score_neg, _ = distmult(negative_graph, self.G, h, pretrain_mode=False, mode='train_neg')
+            if args.all_layers_LSP:
+                h_inter, h, beta_kl_loss, distmult = self.model(self.G, pretrain_mode = False, mode = 'train', return_h_and_kl=True, return_all_layer_h=True) 
+            else:
+                h, beta_kl_loss, distmult = self.model(self.G, pretrain_mode = False, mode = 'train', return_h_and_kl=True) 
+            
+            pred_score_pos, _ = distmult(self.G, self.G, h, pretrain_mode=False, mode='train_pos', verbose=verbose) ## Mystery No.2, why did psuedo=True cause error? 
+            pred_score_neg, _ = distmult(negative_graph, self.G, h, pretrain_mode=False, mode='train_neg', verbose=verbose)
 
             pos_score = torch.cat([pred_score_pos[i] for i in self.dd_etypes])
             neg_score = torch.cat([pred_score_neg[i] for i in self.dd_etypes])
 
             scores = torch.sigmoid(torch.cat((pos_score, neg_score)).reshape(-1,))
-            # print(f'lenth of regular train: {len(scores)}')
             labels = [1] * len(pos_score) + [0] * len(neg_score)
-            loss = F.binary_cross_entropy(scores, torch.Tensor(labels).float().to(self.device)) + beta_kl_loss
+            loss = F.binary_cross_entropy(scores, torch.Tensor(labels).float().to(self.device)) #+ beta_kl_loss
 
-            LSP_loss = 0
+            Total_LSP_loss = 0
             if self.LS_target is not None:
                 ## kg_all is used to compute the LS vector of all label pairs but only using the train split to compute the LS vector
-                #### TODO #### Change kg_all to G and allow all computation on all disease node's neighbor somehow
-                _, _, LS_pred = distmult(self.G, self.G, h, mode=None, pretrain_mode=False, LSP=self.LSP, LSP_size=self.LSP_size)
-
-                # for i, (LS_i, LS_target_i) in enumerate(zip(LS_pred, self.LS_target)):
+                if args.all_layers_LSP:
+                    h_layers = [h_inter, h]
+                else:
+                    h_layers = [h]
+                if len(self.LS_target) == self.G.num_nodes("disease"):
+                    self.LS_target = [self.LS_target]
                 LSP_strt = time.time()
-                for LS_i, LS_target_i in zip(LS_pred, self.LS_target):
-                    # LS_target_i = LS_target_i.coalesce()
-                    # LS_i, LS_target_i = LS_i.coalesce(), LS_target_i.coalesce()
-                    if len(LS_i) > 0:
-                    # if len(LS_i.values()) > 0:
-                        ## softmax LS_i
-                        pred_prob = F.softmax(LS_i)
-                        # target_prob = LS_target_i.values() 
-                        ## compute loss
-                        LSP_loss += F.kl_div(pred_prob.log(), LS_target_i) ## pre-softmaxed target prob
+                for i, (h_layer, LS_target, sigma) in enumerate(zip(h_layers, self.LS_target, args.sigmas)):
+                    _, _, LS_pred = distmult(self.G, self.G, h_layer, mode=None, pretrain_mode=False, LSP=self.LSP, LSP_size=self.LSP_size, sigma=sigma, verbose=verbose)
 
-                # for (k,v), (k_pred,v_pred) in zip(self.LS_target.items(), enumerate(LS_pred)):
-                #     #### TODO #### we can try a kernel trick to comptue LS and also between LS if you wish?
-                #     if len(v) > 0:
-                #         v_pred = torch.sigmoid(v_pred)
-                #         v_pred = torch.clamp(v_pred, min=1e-9)
-                #         v_pred = v_pred / v_pred.sum()
-                #         log_v_pred = v_pred.log()
-
-                #         # print(v_pred)
-                #         # print(v)
-                #         # print(torch.isinf(v).any())
-                #         # print(torch.isinf(log_v_pred).any())
-                #         # print(torch.isnan(v).any())
-                #         # print(torch.isnan(log_v_pred).any())
-                #         # print(torch.isnan(v.log()).any())
-                #         # print(torch.isinf(v.log()).any())
-
-                #         LSP_loss = LSP_loss + F.kl_div(log_v_pred, v)
+                    LSP_loss = 0
+                    if epoch == 0:
+                        count = 0
+                        max_len = 0
+                        for x in LS_pred:
+                            new_len = len(x)
+                            max_len = max_len if max_len >= new_len else new_len
+                            if x.numel() > 1:
+                                count += 1
+                        self.MAX_LSP_LEN = max_len
+                        count2 = 0
+                        for x in LS_target:
+                            if x.numel() > 1:
+                                count2 += 1
+                        assert count == count2
                         
-                ## Lambda is incorporated below
-                LSP_loss = 100 * LSP_loss / len(LS_pred)
-                print(LSP_loss)
-                # print(v_pred)
-                # print(v)
-                # print(LSP_loss)
-                if self.g_pos_pseudo is None:
-                    if self.use_og:
-                        loss = loss + LSP_loss
-                    else:
-                        loss = LSP_loss
-                print(f"LSP loss computation time taken: {time.time() - LSP_strt}")
+                    pred_probs = []
+                    target_probs = []
+                    for LS_i, LS_target_i in zip(LS_pred, LS_target):
+                        if len(LS_i) > 0:
+                            ## softmax LS_i
+                            pred_prob = F.softmax(LS_i)
+                            ## Padding:
+                            to_pad = (0, self.MAX_LSP_LEN - len(pred_prob))
+                            padded_pred_prob = F.pad(pred_prob, to_pad, mode="constant", value=0)
+                            padded_target_prob = F.pad(LS_target_i, to_pad, mode="constant", value=0)
+                            pred_probs.append(padded_pred_prob)
+                            target_probs.append(padded_target_prob)
+                    stacked_pred_probs = torch.stack(pred_probs)
+                    stacked_target_probs = torch.stack(target_probs)
+                    mask = stacked_target_probs != 0
+                    eps = 1e-8
+                    LSP_loss = (torch.where(mask, stacked_target_probs * ((stacked_target_probs+eps).log() - (stacked_pred_probs+eps).log()), torch.tensor(0)).sum(dim=-1) / mask.sum(dim=-1)).sum()
+                    print(f"{i} layer LSP loss: {LSP_loss}")
+                    ## Lambda is incorporated below
+                    Total_LSP_loss += 500 * LSP_loss / len(LS_pred)
+                # print(f"num LSP layers: {len(h_layers)}")
+                Total_LSP_loss /= len(h_layers) ## normalize LSP loss
+                print(f"Total LSP loss is: {Total_LSP_loss}. LSP loss computation time taken: {time.time() - LSP_strt}")
 
-            if self.g_pos_pseudo is not None:
+            if self.g_pos_pseudo is not None or self.teacher_G is not None:
                 ## second loss with psuedo labels
-                ## Things Omar could do:
-                ## Instead of just binary ones or zeros, need probabilities
-                ## Test out psuedo labels with negative sampling too. How does neg_sampler work?
-                    ## Q. How are the pos_score computed not on the entire Graph but only between drug_disease relation? A. We compute all the prediction but index `dd_etypes` to get the drug disease relation scores only
-                    ## Q. How does the neg_sampling only create negative sampling between drug_disease relation? A. Same reason as above. 
-                ## we can collapse the below code with the above. 
-                # g_pos_psuedo = dgl.heterograph(self.additional_train, num_nodes_dict = {ntype: self.G.number_of_nodes(ntype) for ntype in self.G.ntypes}, device=self.device)
-                # g_pos_psuedo, g_neg_psuedo = evaluate_graph_construct(self.df_valid, self.G, 'fix_dst', 1, self.device)
+                if self.teacher_G is not None:
+                    ## no augmentation of random graph if fixed enable
+                    if (not args.fixed_flyKD or epoch==0) and (not args.occasional_flyKD or epoch % args.occasional_flyKD == 0):
+                        del self.soft_psuedo_prob
+                        k = args.random_pseudo_k
+                        num_drug = self.G.num_nodes("drug")
+                        num_disease = self.G.num_nodes("disease")
+                        train_out = copy.deepcopy(self.data.dd_train_out)
+                        is_train_mask_lst = []
+                        pseudo_etype_len = {}
+                        for etype, (src, dst) in train_out.items():
+                            ## generate src dst pairs for random graph
+                            if args.rel_multinomial_ptrain:
+                                dis_idx = self.data.dis_rel_idx_ptrain[etype[1]].index
+                                drug_idx = self.data.drug_rel_idx_ptrain[etype[1]].index
+                                dis_idx_degree = self.data.dis_rel_idx_ptrain[etype[1]].values
+                                drug_idx_degree = self.data.drug_rel_idx_ptrain[etype[1]].values
+                                pseudo_src = np.random.choice(drug_idx, k, replace=True, p=drug_idx_degree)
+                                pseudo_dst = np.random.choice(dis_idx, k, replace=True, p=dis_idx_degree)
+                                if verbose:
+                                    print(f"using rel_ptrain for {etype[1]} where num drugs_idx: {len(pseudo_src)}, num dis_idx: {len(pseudo_dst)} where\
+sampled num drugs: {len(pseudo_src)}, sampled num dis: {len(pseudo_dst)}")
+                            elif args.multinomial_ptrain:
+                                dis_idx = self.data.dis_idx_ptrain.index
+                                drug_idx = self.data.drug_idx_ptrain.index
+                                dis_idx_degree = self.data.dis_idx_ptrain.values
+                                drug_idx_degree = self.data.drug_idx_ptrain.values
+                                if args.modified_multinomial:
+                                    if verbose:
+                                        print(f"using modified multinomial")
+                                    iter_ = 1.5
+                                    dis_idx_degree = np.power(dis_idx_degree, iter_)
+                                    drug_idx_degree = np.power(drug_idx_degree, iter_)
+                                    probs = np.power(probs, 1.5)
+                                    dis_idx_degree /= dis_idx_degree.sum()
+                                    drug_idx_degree /= drug_idx_degree.sum()
+                                pseudo_src = np.random.choice(drug_idx, k, replace=True, p=drug_idx_degree)
+                                pseudo_dst = np.random.choice(dis_idx, k, replace=True, p=dis_idx_degree)
+                                if verbose:
+                                    print(f"using multionomial_ptrain for {etype[1]} where num drugs_idx: {len(pseudo_src)}, num dis_idx: {len(pseudo_dst)} where\
+sampled num drugs: {len(pseudo_src)}, sampled num dis: {len(pseudo_dst)}")
+                            else:
+                                pseudo_srcs = []
+                                if args.ptrain:
+                                    drug_idx = self.data.drug_idx_ptrain.index
+                                    dis_idx = self.data.dis_idx_ptrain.index
+                                elif args.rel_ptrain:
+                                    ## relation specific ptrain constraint
+                                    dis_idx = self.data.dis_rel_idx_ptrain[etype[1]].index
+                                    drug_idx = self.data.drug_rel_idx_ptrain[etype[1]].index
+                                    if verbose:
+                                        print(f"using rel_ptrain for {etype[1]} where num drugs: {len(drug_idx)}, num dis: {len(dis_idx)}")
+                                else:
+                                    dis_idx = self.data.dis_idx_wout_val_test.numpy() if args.fly_no_val_test else np.arange(num_disease)
+                                for _ in dis_idx:
+                                    if args.ptrain:
+                                        sampled_drug_idx = np.random.choice(drug_idx, k, replace=False)
+                                        pseudo_srcs.append(sampled_drug_idx)
+                                    else:
+                                        pseudo_srcs.append(np.random.randint(0, num_drug, (k,)))
+                                pseudo_src = np.concatenate(pseudo_srcs)
+                                pseudo_dst = dis_idx.repeat(k)
 
-                # psuedo_pos_scores_rel, psuedo_neg_scores_rel, _, _, beta_kl_loss = self.model(self.G, g_neg_psuedo, self.g_pos_psuedo, psuedo=True)
+                            ## Track what was train data and what was generated pseudo
+                            append_is_train_mask = torch.cat([torch.ones(len(src)), torch.zeros(len(pseudo_src))]).int()
+                            pseudo_etype_len[etype] = len(append_is_train_mask)
+                            is_train_mask_lst.append(append_is_train_mask)
+                            ## Keep the training pseudo scores
+                            if args.no_ptrain_flyKD:
+                                print(f"The size difference of not having pseudo train is {np.concatenate([src, pseudo_src]).shape[0] - pseudo_src.shape[0]}")
+                                src = pseudo_src
+                                dst = pseudo_dst
+                            else:
+                                src = np.concatenate([src, pseudo_src])
+                                dst = np.concatenate([dst, pseudo_dst])
+                            train_out[etype] = (src, dst)
+                            assert pseudo_src.shape == pseudo_dst.shape
+                        g_on_the_fly = dgl.heterograph(train_out, num_nodes_dict = {ntype: self.G.number_of_nodes(ntype) for ntype in self.G.ntypes}).to(self.device)
+                    else:
+                        if args.occasional_flyKD:
+                            print(f"Occasional_flyKD counter: {epoch % args.occasional_flyKD}")
+                        else:
+                            print(f"Fixed flyKD mode enabled: Using the same g_on_the_fly graph")
+                    ## compute positive scores now
+                    pseudo_rels1, _ = distmult(g_on_the_fly, self.teacher_G, h, mode=None, pretrain_mode=False, keep_grad_for_sl=True, verbose=verbose)
+                    pos_score = torch.cat([pseudo_rels1[etype] for etype in train_out.keys()])
+                    pseudo_pos_scores = pos_score.clone()
+                    is_train_mask = torch.cat(is_train_mask_lst).bool()
 
-                print("calling positive graph for pseudo")
-                pseudo_pos_scores_rel, _ = distmult(self.g_pos_pseudo, self.G, h, mode=None, pretrain_mode=False, pseudo_training=True)
+                    ## run teacher model to generate pseudo labels on the fly
+                    with torch.no_grad():
+                        h, _, distmult = self.teacher_model(self.teacher_G, pretrain_mode = False, mode = 'train', return_h_and_kl=True) 
+                        pseudo_rels2, _ = distmult(g_on_the_fly, self.teacher_G, h, mode=None, pretrain_mode=False, keep_grad_for_sl=True, verbose=verbose)
+                        pos_score = torch.cat([pseudo_rels2[i] for i in self.pseudo_dd_etypes])
 
-                ## psuedo skips on off-label dd relation. 
-                pseudo_pos_scores = torch.cat([pseudo_pos_scores_rel[i] for i in self.pseudo_dd_etypes])
-                if self.neg_pseudo_sampling:
-                    # g_neg_pseudo = pseudo_neg_sampler(self.g_pos_pseudo) 
-                    g_neg_pseudo = pseudo_neg_sampler(self.g_pos_dd) 
-                    print("calling negative graph for pseudo")
-                    pseudo_neg_scores_rel, _ = distmult(g_neg_pseudo, self.G, h, mode=None, pretrain_mode=False, pseudo_training=True)
+                        if args.strong_scores is not None:
+                            constraint = args.strong_scores
+                            confidence_mask = pos_score > constraint
+                            ## Keep the real train dataset
+                            confidence_mask[is_train_mask] = True
+                            self.soft_psuedo_prob = torch.sigmoid(pos_score[confidence_mask]) ## label
+                            pseudo_pos_scores = pseudo_pos_scores[confidence_mask] ## score
+                            ## get the train_mask of updated strong scores. 
+                            dummy_confidence_mask = torch.empty(len(confidence_mask)).long()
+                            dummy_confidence_mask[confidence_mask] = torch.arange(len(pseudo_pos_scores)) ## number the True values
+                            train_idx = dummy_confidence_mask[is_train_mask] ## Obtain the idx correponsidng to train mask
+                            is_train_mask = torch.zeros(len(pseudo_pos_scores)).bool()
+                            is_train_mask[train_idx] = True
+                        else:
+                            self.soft_psuedo_prob = torch.sigmoid(pos_score)
+                        if verbose:
+                            print(f"Total pseudo length including train: {len(self.soft_psuedo_prob)}")
+                            
+                        # generate negative sampling for strong pseudo labels
+                        if args.strong_scores is not None:
+                            masked_train_out = {}
+                            confidence_mask = confidence_mask.cpu()
+                            for i, etype in enumerate(self.pseudo_dd_etypes):
+                                if i==0:
+                                    etype_len = pseudo_etype_len[etype]
+                                    masked_src = train_out[etype][0][confidence_mask[:etype_len]]
+                                    masked_dst = train_out[etype][1][confidence_mask[:etype_len]]
+                                else:
+                                    etype_len = pseudo_etype_len[etype]
+                                    masked_src = train_out[etype][0][confidence_mask[-etype_len:]]
+                                    masked_dst = train_out[etype][1][confidence_mask[-etype_len:]]                                
+                                masked_train_out[etype] = (masked_src, masked_dst)
+                            g_masked_on_the_fly = dgl.heterograph(masked_train_out, num_nodes_dict = {ntype: self.G.number_of_nodes(ntype) for ntype in self.G.ntypes}).to(self.device)
+                            assert pseudo_rels1.keys() == pseudo_rels2.keys()
+                else:
+                    pseudo_pos_scores_rel, _ = distmult(self.g_pos_pseudo, self.G, h, mode=None, pretrain_mode=False, keep_grad_for_sl=True, verbose=verbose)
+                    ## psuedo skips on off-label dd relation. 
+                    pos_scores_rel_lst = [pseudo_pos_scores_rel[i] for i in self.pseudo_dd_etypes]
+                    pseudo_pos_scores = torch.cat(pos_scores_rel_lst)
+                    if verbose:                    
+                        print("calling positive graph for pseudo")
+                        print(f"number of labels in pseudo graph: {len(pseudo_pos_scores)}")
+                    
+                if args.limited_neg_pseudo_sampling or args.neg_pseudo_sampling:
+                    if args.limited_neg_pseudo_sampling:
+                        g_neg_pseudo = pseudo_neg_sampler(self.g_dd_train) 
+                    elif args.neg_pseudo_sampling:
+                        g_neg_pseudo = pseudo_neg_sampler(self.g_pos_pseudo)
+                    if verbose:
+                        if args.on_the_fly_KD:
+                            print(f"train length: {is_train_mask.float().sum()}")
+                        print("calling negative graph for pseudo")
+                    pseudo_neg_scores_rel, _ = distmult(g_neg_pseudo, self.G, h, mode=None, pretrain_mode=False, keep_grad_for_sl=True, verbose=verbose)
                     pseudo_neg_scores = torch.cat([pseudo_neg_scores_rel[i] for i in self.pseudo_dd_etypes])
-                    pseudo_labels = torch.cat([self.soft_psuedo_prob, torch.zeros(pseudo_neg_scores.shape, device=self.device)]) 
-                    pseudo_scores = torch.cat([pseudo_pos_scores, pseudo_neg_scores])
+                    if args.on_the_fly_KD:
+                        is_train_mask = torch.cat([is_train_mask, torch.ones(pseudo_neg_scores.shape).bool()])
+                    if not args.curriculum3 or 1200 <= epoch:
+                        pseudo_labels = torch.cat([self.soft_psuedo_prob, torch.zeros(pseudo_neg_scores.shape, device=self.device)]) 
+                        pseudo_scores = torch.cat([pseudo_pos_scores, pseudo_neg_scores])
+                    else:
+                        pseudo_scores = pseudo_pos_scores
+                        pseudo_labels = self.soft_psuedo_prob
                 else:
                     pseudo_scores = pseudo_pos_scores
                     pseudo_labels = self.soft_psuedo_prob
-                ## Might not need negative labels because we have logits
-                ## Might want to use KL Divergence? 
-                # eps = 1e-12
-                # pseudo_loss = pseudo_labels * (torch.log(pseudo_labels + eps) - F.logsigmoid(pseudo_scores)) + \
-                #             (1 - pseudo_labels) * (torch.log(1 - pseudo_labels + eps) - torch.log(1 - torch.sigmoid(pseudo_scores) + eps))
-                # pseudo_loss = pseudo_loss.mean()
-                if self.kl:
-                    print("using kl")
-                    pseudo_labels = pseudo_labels.unsqueeze(dim=1)
-                    pseudo_scores = F.sigmoid(pseudo_scores.unsqueeze(dim=1))
-                    pseudo_labels_dist = torch.cat([1 - pseudo_labels, pseudo_labels], dim=1) # torch.Size([1366400, 2])
-                    pseudo_scores_dist = torch.cat([1 - pseudo_scores, pseudo_scores], dim=1) # torch.Size([1366400, 2])
-                    pseudo_loss = F.kl_div(torch.log(pseudo_scores_dist), pseudo_labels_dist) + beta_kl_loss
+                if args.balance_loss:
+                    ## C + I = T where these represents number of relations, cind, ind, total respectively. 
+                    ## n * C / I = OC / OI we want to multioply n so that the relation ratio match up. n is the multiplier, OC, OI are original cind, ind.
+                    ## T / (n * c + I) * (n * C + I) = T, rescale the entire loss value to maintain the magnitude of the loss the same by T / (n * c + I)
+                    C = len(pos_scores_rel_lst[0])
+                    I = len(pos_scores_rel_lst[1])
+                    T = C + I
+                    n = self.OC / self.OI * I / C ## cind_reweight_term
+                    rescale_back = T / (n * C + I)
+                    print(f"ratios C:I {C/I}, ratios OC: OI {self.OC/self.OI}")
+                    print(f"rescaling C by {n} then scale back everything with {rescale_back}")
+                    weight_tensor = torch.ones(pseudo_labels.shape)
+                    weight_tensor[:C] *= n
+                    weight_tensor[T: T+C] *= n
+                    weight_tensor = weight_tensor.to(self.device)
+                    pseudo_loss = F.binary_cross_entropy(torch.sigmoid(pseudo_scores), pseudo_labels, weight=weight_tensor)
+                    pseudo_loss *= rescale_back
+                    pseudo_loss += beta_kl_loss
+                elif args.no_curriculum:
+                    pseudo_train_loss = F.binary_cross_entropy(torch.sigmoid(pseudo_scores[is_train_mask]), pseudo_labels[is_train_mask])
+                    pseudo_random_loss = F.binary_cross_entropy(torch.sigmoid(pseudo_scores[~is_train_mask]), pseudo_labels[~is_train_mask])
+                    pseudo_loss = 0.05 * loss + pseudo_train_loss + pseudo_random_loss
+                    pseudo_loss /= 1 + 1 + 0.05
+                    if verbose:
+                        print("using no curriculum formula")
+                        print(f"loss: {loss}, pseudo train loss: {pseudo_train_loss}, pseudo_random_loss: {pseudo_random_loss}")
+                elif args.curriculum1:
+                    assert args.on_the_fly_KD
+                    pseudo_train_loss = F.binary_cross_entropy(torch.sigmoid(pseudo_scores[is_train_mask]), pseudo_labels[is_train_mask])
+                    pseudo_random_loss = F.binary_cross_entropy(torch.sigmoid(pseudo_scores[~is_train_mask]), pseudo_labels[~is_train_mask])
+                    lambda_og = lambda epoch: 1 if epoch <= 400 else 1.95 - .95/400 * epoch if epoch <= 800 else 0.05
+                    lambda_pseudo_train = lambda epoch: 0 if epoch <= 400 else -1 + epoch/400 if epoch <= 800 else 1
+                    lambda_pseudo_random = lambda epoch: 0 if epoch <= 800 else -2 + epoch/400 if epoch <= 1200 else 1
+                    pseudo_loss = lambda_og(epoch)*loss + lambda_pseudo_train(epoch)*pseudo_train_loss + lambda_pseudo_random(epoch)*pseudo_random_loss
+                    normalizer = lambda_og(epoch) + lambda_pseudo_train(epoch) + lambda_pseudo_random(epoch)
+                    pseudo_loss /= normalizer
+                    if verbose:
+                        print(f"Using curriculum formula 1: L_og={lambda_og(epoch)/normalizer}, L_tr={lambda_pseudo_train(epoch)/normalizer}, \
+L_r={lambda_pseudo_random(epoch)/normalizer}")
+                elif args.curriculum2:
+                    pseudo_train_loss = F.binary_cross_entropy(torch.sigmoid(pseudo_scores), pseudo_labels)
+                    lambda_og = lambda epoch: 1 if epoch <= 600 else 1.95 - .95/600 * epoch if epoch <= 1200 else 0.05
+                    lambda_pseudo_train = lambda epoch: 0 if epoch <= 600 else -1 + epoch/600 if epoch <= 1200 else 1
+                    pseudo_loss = lambda_og(epoch)* loss + lambda_pseudo_train(epoch)*pseudo_train_loss
+                    normalizer = lambda_og(epoch) + lambda_pseudo_train(epoch)
+                    pseudo_loss /= normalizer
+                    if verbose:
+                        print(f"Using curriculum formula 2: L_og={lambda_og(epoch)/normalizer}, L_tr={lambda_pseudo_train(epoch)/normalizer}")
+                elif args.curriculum3:
+                    pseudo_random_loss = F.binary_cross_entropy(torch.sigmoid(pseudo_scores), pseudo_labels)
+                    lambda_og = lambda epoch: 1 if epoch <= 600 else 1.95 - .95/600 * epoch if epoch <= 1200 else 0.05
+                    lambda_pseudo_random = lambda epoch: 0 if epoch <= 600 else -1 + epoch/600 if epoch <= 1200 else 1
+                    pseudo_loss = lambda_og(epoch)*loss + lambda_pseudo_random(epoch)*pseudo_random_loss
+                    normalizer = lambda_og(epoch) + lambda_pseudo_random(epoch)
+                    pseudo_loss /= normalizer
+                    if verbose:
+                        print(f"Using curriculum formula 3: L_og={lambda_og(epoch)/normalizer}, L_tr={lambda_pseudo_random(epoch)/normalizer}")
+                elif args.curriculum1_stepwise:
+                    assert args.on_the_fly_KD
+                    pseudo_train_loss = F.binary_cross_entropy(torch.sigmoid(pseudo_scores[is_train_mask]), pseudo_labels[is_train_mask])
+                    pseudo_random_loss = F.binary_cross_entropy(torch.sigmoid(pseudo_scores[~is_train_mask]), pseudo_labels[~is_train_mask])
+                    lambda_og = lambda epoch: 1 if epoch <= 400 else 0.05
+                    lambda_pseudo_train = lambda epoch: 0 if epoch <= 400 else 1
+                    lambda_pseudo_random = lambda epoch: 0 if epoch <= 800 else 1
+                    pseudo_loss = lambda_og(epoch)*loss + lambda_pseudo_train(epoch)*pseudo_train_loss + lambda_pseudo_random(epoch)*pseudo_random_loss
+                    normalizer = lambda_og(epoch) + lambda_pseudo_train(epoch) + lambda_pseudo_random(epoch)
+                    pseudo_loss /= normalizer
+                    if verbose:
+                        print(f"Using curriculum formula 4: L_og={lambda_og(epoch)/normalizer}, L_tr={lambda_pseudo_train(epoch)/normalizer}, \
+L_r={lambda_pseudo_random(epoch)/normalizer}")
                 else:
-                    print("using CE")
                     pseudo_loss = F.binary_cross_entropy(torch.sigmoid(pseudo_scores), pseudo_labels) + beta_kl_loss
-                # psuedo_loss = F.binary_cross_entropy(torch.sigmoid(psuedo_neg_scores), torch.ones(psuedo_scores.shape, device=self.device))
-
-                print(f"loss: {loss}")
-                print(f"pseudo loss: {pseudo_loss}")
-                print(f'pseudo_scores: {pseudo_scores[0], pseudo_labels[0]}')
-                print(f"beta kl loss: {beta_kl_loss}")
-                
-                if self.use_og:
+                if verbose:
+                    print(f"loss: {loss}, pseudo loss: {pseudo_loss}, beta kl loss: {beta_kl_loss}")
+                    idx = random.randint(0, len(pseudo_scores)-1)
+                    print(f'Example pseudo_scores: {pseudo_scores[idx].item(), pseudo_labels[idx].item()}')
+                ## only use use_og if not using flyKD
+                if self.use_og: 
                     loss = 0.05 * loss + pseudo_loss ## can try adjusting loss with weighted parameters...
+                    loss /= 0.05 + 1
                 else:
                     loss = pseudo_loss
-                if self.LSP:
-                    loss = loss + LSP_loss
-            
-
-            # torch.autograd.set_detect_anomaly(True)
+                    
+            ## Adding LSP loss in the end because we want to avoid 0.05 compression of loss. 
+            if self.LSP:
+                loss = loss + Total_LSP_loss
             optimizer.zero_grad()
             with torch.autograd.set_detect_anomaly(True):
                 loss.backward()
-            # print(f"printing model's gradients: {[p.grad for p in self.model.parameters()]}")
             optimizer.step()
-            scheduler.step(loss)
+            if args.curriculum1 or args.curriculum2:
+                if epoch >= 1600:
+                    scheduler.step(loss)
+            else:
+                scheduler.step(loss)
             end = time.time()
-            print(f'Epoch Training time: {end - strt}')
+            if verbose:
+                print(f'Epoch Training time: {end - strt}')
 
             if self.weight_bias_track:
                 self.wandb.log({"Training Loss": loss})
 
             if epoch % train_print_per_n == 0:
                 # training tracking...
+                self.model.eval()
                 auroc_rel, auprc_rel, micro_auroc, micro_auprc, macro_auroc, macro_auprc = get_all_metrics_fb(pred_score_pos, pred_score_neg, scores.reshape(-1,).detach().cpu().numpy(), labels, self.G, True)
 
                 if self.weight_bias_track:
@@ -475,13 +679,13 @@ class TxGNN:
                 print('Validation.....')
                 self.model.eval()
                 (auroc_rel, auprc_rel, micro_auroc, micro_auprc, macro_auroc, macro_auprc), loss = evaluate_fb(self.model, self.g_valid_pos, self.g_valid_neg, self.G, self.dd_etypes, self.device, mode = 'valid')
-                self.model.train()
 
                 strt = time.time()
                 ## Now way <400 epoch does the best.
-                if epoch == n_epoch-1: ## Just storing the last because of some 'killed' error
-                # if best_val_acc < macro_auroc and epoch > int(0.8 * n_epoch): 
+                if best_val_acc < macro_auroc:
                     best_val_acc = macro_auroc
+                if epoch == n_epoch-1: ## Just storing the last because of some 'killed' error and the sake of time.
+                # if best_val_acc < macro_auroc and epoch > int(0.8 * n_epoch): 
                     self.best_model = copy.deepcopy(self.model)
                     self.best_G = copy.deepcopy(self.G)
                 print(f"time it took to deep copy the model and graph: {time.time() - strt}")
@@ -557,27 +761,22 @@ class TxGNN:
         
     def save_model(self, path):
         if not os.path.exists(path):
-            os.mkdir(path)
+            os.makedirs(path)
         
         if self.config is None:
             raise ValueError('No model is initialized...')
         
         with open(os.path.join(path, 'config.pkl'), 'wb') as f:
             pickle.dump(self.config, f)
-       
         embeddings = {}
         for ntype in self.best_G.ntypes:
             embeddings[ntype] = self.G.nodes[ntype].data['inp']
-            # print(self.G.nodes)
-            # print(self.G.nodes[ntype])
-            # print(self.G.nodes[ntype].data['inp'])
         torch.save(embeddings, os.path.join(path, 'best_G.pt'))
         torch.save(self.g_valid_pos, os.path.join(path, 'g_valid_pos.pt'))
         torch.save(self.g_valid_neg, os.path.join(path, 'g_valid_neg.pt'))
         torch.save(self.g_test_pos, os.path.join(path, 'g_test_pos.pt'))
         torch.save(self.g_test_neg, os.path.join(path, 'g_test_neg.pt'))
         torch.save(self.best_model.state_dict(), os.path.join(path, 'model.pt'))
-        #save_graphs(os.path.join(path, 'graph_dgl.bin', [self.G]))
     
     def predict(self, df):
         out = {}
@@ -680,35 +879,32 @@ class TxGNN:
                       
         return similar_diseases
                       
-    def load_pretrained(self, path, legacy=False, super_legacy=False):
+    def load_pretrained(self, path, legacy=False, super_legacy=False, keep_config=False):
         ## load config file
         
         with open(os.path.join(path, 'config.pkl'), 'rb') as f:
             config = pickle.load(f)
             
-        self.model_initialize(**config, debug=True)
-        self.config = config
-        # self.G = initialize_node_embedding(self.G.to(torch.device("cpu")), config['n_inp']).to(self.device)
+        if not keep_config:
+            if hasattr(config, "args"):
+                config["args"].on_the_fly_KD = False
+                print("turning off recursively creating more teacher models")
+            self.model_initialize(**config)
+            self.config = config
         
         state_dict = torch.load(os.path.join(path, 'model.pt'), map_location = torch.device('cpu'))
         if legacy: 
             state_dict_G = torch.load(os.path.join(path, 'G.pt'), map_location = torch.device('cpu'))
         else:
             state_dict_G = torch.load(os.path.join(path, 'best_G.pt'), map_location = torch.device('cpu'))
-            # if next(iter(state_dict))[:7] == 'module.':
-            #     # the pretrained model is from data-parallel module
-            #     from collections import OrderedDict
-            #     new_state_dict = OrderedDict()
-            #     for k, v in state_dict.items():
-            #         name = k[7:] # remove `module.`
-            #         new_state_dict[name] = v
-            #     state_dict = new_state_dict
         if not super_legacy:
             self.g_valid_pos = torch.load(os.path.join(path, 'g_valid_pos.pt'))
             self.g_valid_neg = torch.load(os.path.join(path, 'g_valid_neg.pt'))
             self.g_test_pos = torch.load(os.path.join(path, 'g_test_pos.pt'))
             self.g_test_neg = torch.load(os.path.join(path, 'g_test_neg.pt'))
-        self.model.load_state_dict(state_dict)
+            
+        self.model.load_state_dict(state_dict, strict=False)
+        
         for ntype, embs in state_dict_G.items():
             self.G.nodes[ntype].data['inp'] = embs
             if not legacy:
@@ -718,7 +914,7 @@ class TxGNN:
         self.G = self.G.to(self.device)
         self.best_G = self.best_G.to(self.device)
         self.best_model = self.model
-        print(f"Checkpoint loaded from path: {path}")
+        print(f"Loaded a trained model from path: {path}. Could be fully trained or only the pretrain phase")
         
     def train_graphmask(self, relation = 'indication',
                               learning_rate = 3e-4,

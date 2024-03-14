@@ -33,7 +33,8 @@ class TxData:
                      no_kg = False,
                      additional_train=None,
                      create_psuedo_edges=False,
-                     soft_pseudo=False):
+                     soft_pseudo=False,
+                     pseudo_on_train = None):
         
         if split not in ['random', 'complex_disease', 'disease_eval', 'cell_proliferation', 'mental_health', 'cardiovascular', 'anemia', 'adrenal_gland', 'full_graph', 'downstream_pred']:
             raise ValueError("Please select one of the following supported splits: 'random', 'complex_disease', 'disease_eval', 'cell_proliferation', 'mental_health', 'cardiovascular', 'anemia', 'adrenal_gland'")
@@ -82,29 +83,19 @@ class TxData:
             df_train, df_valid, df_test = create_split(df, split, disease_eval_idx, split_data_path, seed)
         else:
             print('Splits detected... Loading splits....')
-            df_train = pd.read_csv(os.path.join(split_data_path, 'train.csv'))
-            df_valid = pd.read_csv(os.path.join(split_data_path, 'valid.csv'))
-            df_test = pd.read_csv(os.path.join(split_data_path, 'test.csv'))     
+            df_train = pd.read_csv(os.path.join(split_data_path, 'train.csv'), low_memory=False)
+            df_valid = pd.read_csv(os.path.join(split_data_path, 'valid.csv'), low_memory=False)
+            df_test = pd.read_csv(os.path.join(split_data_path, 'test.csv'), low_memory=False)     
             
         if split not in ['random', 'complex_disease', 'disease_eval', 'full_graph', 'downstream_pred']:
-            # in disease area split
             df_test = process_disease_area_split(self.data_folder, df, df_test, split)
 
-        ## I see duplicate rows? 
-        df_train = df_train.drop_duplicates() ## To keep things the same.
-        # if drop_dup_all:
+        df_train = df_train.drop_duplicates() 
         df_valid = df_valid.drop_duplicates()       
         df_test = df_test.drop_duplicates() 
     
         if additional_train is not None:
             ## creating rev relations
-            # additional_train = pd.read_csv(additional_train)
-            # unique_rels = additional_train.relation.unique()
-            # unique_rels_series = pd.Series(unique_rels)
-            print(f'psuedo df_train size before adding rev_ relations: {len(additional_train)}')
-            # additional_train = reverse_rel_generation(None, additional_train, unique_rels_series, psuedo=True)
-            print(f'psuedo df_train size after adding rev_ relations: {len(additional_train)}')
-
             # insert pseudo data to create pseudo edges
             if create_psuedo_edges:
                 print(f'total df train size before psuedo label injection: {len(df_train)}')
@@ -114,25 +105,14 @@ class TxData:
         print('Creating DGL graph....')
         # create dgl graph
         self.G = create_dgl_graph(df_train, df) ## df is here to obtain the highest index number which is required to create a contiguous DGL graph
+        self.full_G = create_dgl_graph(df, df) ## df is here to obtain the highest index number which is required to create a contiguous DGL graph
 
-        def construct_dd_only_graph(df_, soft_pseudo_logits=None): ## only to generate psuedo graphs
-            ## not generating off labels for dd_etypes
+        def construct_dd_only_graph(df_, soft_pseudo_logits=None, verbose=False, return_out=False): ## only to generate psuedo graphs
             pseudo_dd_etypes = [('drug', 'contraindication', 'disease'), 
                         ('drug', 'indication', 'disease'), 
-                        # ('disease', 'rev_contraindication', 'drug'), 
-                        # ('disease', 'rev_indication', 'drug'),
                         ] 
-            
-            # dd_etypes = [('drug', 'contraindication', 'disease'), 
-            #             ('drug', 'indication', 'disease'), 
-            #             ('drug', 'off-label use', 'disease'),
-            #             ('disease', 'rev_contraindication', 'drug'), 
-            #             ('disease', 'rev_indication', 'drug'), 
-            #             ('disease', 'rev_off-label use', 'drug')]
             out = {}
-            # df_in = df_[['x_idx', 'relation', 'y_idx']]
             df_in = df_
-            # for etype in g.canonical_etypes:
             debug_sum = 0
             for etype in pseudo_dd_etypes:
                 try:
@@ -145,10 +125,14 @@ class TxData:
                 out.update({etype: (src, dst)})
                 if soft_pseudo_logits is not None:
                     soft_pseudo_logits.update({etype: torch.Tensor(df_temp['score'].values)})
-            print(f'total number of labels injected: {debug_sum}')
+
+            if verbose:
+                print(f'total number of labels injected: {debug_sum}')
             g = dgl.heterograph(out, num_nodes_dict = {ntype: self.G.number_of_nodes(ntype) for ntype in self.G.ntypes})
             if soft_pseudo_logits is not None:
                 return g, soft_pseudo_logits 
+            elif return_out:
+                return g, out
             else:
                 return g
         ## add additional training data (self-supervised data)
@@ -157,26 +141,40 @@ class TxData:
         if additional_train is not None and create_psuedo_edges is False:
             ## new dgl to compute for 
             if soft_pseudo:
-                # Set option to display all columns (None means no limit)
-                # pd.set_option('display.max_columns', None)
-                # print(additional_train.head(20))
-                # print(additional_train[additional_train['relation'] == 'rev_indication'].head(20))
-
                 ## create labels for dgl graph
                 soft_pseudo_logits = {}
-                self.g_pos_pseudo, self.soft_psuedo_logits_rel = construct_dd_only_graph(additional_train, soft_pseudo_logits)
+                self.g_pos_pseudo, self.soft_psuedo_logits_rel = construct_dd_only_graph(additional_train, soft_pseudo_logits, verbose=True)
             else:
-                self.g_pos_pseudo = construct_dd_only_graph(additional_train)
+                self.g_pos_pseudo = construct_dd_only_graph(additional_train, verbose=True)
 
         self.df, self.df_train, self.df_valid, self.df_test = df, df_train, df_valid, df_test
-        # self.kg_all = create_dgl_graph(df, df) ## used for computing the Local Structure (LS) vectors
+        ## for negative sampling of disease drug relation
+        self.g_dd_train, self.dd_train_out = construct_dd_only_graph(df_train[df_train.relation.isin(["indication", "contraindication"])], return_out=True)
+        valid_y_idx = df_valid[df_valid["relation"].isin(["indication", "contraindication"])].y_idx
+        test_y_idx = df_test[df_test["relation"].isin(["indication", "contraindication"])].y_idx
+        valid_test_y_idx = torch.tensor(pd.concat([valid_y_idx, test_y_idx]).unique())
+        diseases = torch.arange(self.G.num_nodes("disease"))
+        dis_idx_wout_val_test = diseases[~torch.isin(diseases, valid_test_y_idx)]
+        assert len(dis_idx_wout_val_test) == self.G.num_nodes("disease") - len(valid_test_y_idx)
+        self.dis_idx_wout_val_test = dis_idx_wout_val_test
+        self.drug_idx_ptrain = df_train[df_train["relation"].isin(["indication", "contraindication"])].x_idx.value_counts()
+        self.dis_idx_ptrain = df_train[df_train["relation"].isin(["indication", "contraindication"])].y_idx.value_counts()
+        self.drug_idx_ptrain /= self.drug_idx_ptrain.sum()
+        self.dis_idx_ptrain /= self.dis_idx_ptrain.sum()
+        self.drug_rel_idx_ptrain = {}
+        self.dis_rel_idx_ptrain = {}
+        self.drug_rel_idx_ptrain["indication"] = df_train[df_train["relation"] == "indication"].x_idx.value_counts()
+        self.drug_rel_idx_ptrain["contraindication"] = df_train[df_train["relation"] == "contraindication"].x_idx.value_counts()
+        self.dis_rel_idx_ptrain["indication"] = df_train[df_train["relation"] == "indication"].y_idx.value_counts()
+        self.dis_rel_idx_ptrain["contraindication"] = df_train[df_train["relation"] == "contraindication"].y_idx.value_counts()
+        self.drug_rel_idx_ptrain["indication"] /= self.drug_rel_idx_ptrain["indication"].sum()
+        self.drug_rel_idx_ptrain["contraindication"] /= self.drug_rel_idx_ptrain["contraindication"].sum()
+        self.dis_rel_idx_ptrain["indication"] /= self.dis_rel_idx_ptrain["indication"].sum()
+        self.dis_rel_idx_ptrain["contraindication"] /= self.dis_rel_idx_ptrain["contraindication"].sum()
 
-        self.g_pos_dd = construct_dd_only_graph(df_train)
         self.disease_eval_idx = disease_eval_idx
         self.no_kg = no_kg
         self.seed = seed
-        print(f"additional ")
-        # print(f"additional ")
         print('Done!')
         
         
