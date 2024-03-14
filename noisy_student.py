@@ -31,7 +31,8 @@ if __name__ == '__main__':
     parser.add_argument('--student_size', default=120, type=int)
     parser.add_argument('--save_name', type=str, default=None)
     parser.add_argument('--deg', default=float('inf'), type=float) ## 'inf' for all diseases?
-    parser.add_argument('--epochs', type=int) ## 'inf' for all diseases?
+    parser.add_argument('--kl', action="store_true") ## dummy variable
+    parser.add_argument('--epochs', type=int) 
     parser.add_argument('--set_seed', default=1, type=int)
     parser.add_argument('--soft_pseudo', action='store_true')
     parser.add_argument('--train_then_generate', action='store_true')
@@ -110,7 +111,7 @@ can be retained")
         for i, _ in enumerate(range(args.iter + 1)):
             save_dir, log_file = init_logfile(i, seed, args)
 
-            diff_epochs = f"e{args.epochs}" if args.epochs else ""
+            diff_epochs = f"Results_e{args.epochs}" if args.epochs else ""
             pretrained_path = f"./pretrained_models/{args.teacher_size}_{diff_epochs}/{seed}" 
             ith_model_ckpt = f"{save_dir}{i}_model_ckpt/" 
                 

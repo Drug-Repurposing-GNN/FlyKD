@@ -158,7 +158,7 @@ def init_logfile(i, seed, args):
         create and set logfile to be written. Also write init messages such as args and seed
     '''
     if args.epochs:
-        save_dir = f"./e{args.epochs}/{args.fname}/{seed}/"
+        save_dir = f"./Results_e{args.epochs}/{args.fname}/{seed}/"
     else:
         save_dir = f"./after_saving_rev_e1200_90/{args.fname}/{seed}/" 
 
