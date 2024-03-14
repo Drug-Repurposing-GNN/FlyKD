@@ -144,7 +144,8 @@ During deployment, when evaluate a specific disease, you may want to just mask t
 
 Another setting is to train the entire network without any disease masking. You can do that via `split = 'full_graph'`. This will automatically use 95% of data for training and 5% for validation set calculation to do early stopping. No test set is used. 
 
-
+Cuda Profile: 11.8
+GPU Profile: A5000 & 2080ti
 ### Cite Us
 
 [MedRxiv preprint](https://www.medrxiv.org/content/10.1101/2023.03.19.23287458)
