@@ -309,22 +309,22 @@ def train_w_psuedo_labels(additional_train, seed, save_dir, args, size=None):
                             LSP = LSP,
                             LSP_size=LSP_size,)
     # Train
-    TxGNN1.pretrain(n_epoch = 1, #---
-                    learning_rate = 1e-3,
-                    batch_size = 1024, 
-                    train_print_per_n = 20)
+    # TxGNN1.pretrain(n_epoch = 1, #---
+    #                 learning_rate = 1e-3,
+    #                 batch_size = 1024, 
+    #                 train_print_per_n = 20)
 
-    TxGNN1.finetune(n_epoch = 2000, #---
-                    learning_rate = 5e-4,
-                    train_print_per_n = 5,
-                    valid_per_n = 20,
-                    weight_decay = weight_decay,)
-
-    # TxGNN1.finetune(n_epoch = 5, #---
+    # TxGNN1.finetune(n_epoch = 2000, #---
     #                 learning_rate = 5e-4,
     #                 train_print_per_n = 5,
     #                 valid_per_n = 20,
     #                 weight_decay = weight_decay,)
+
+    TxGNN1.finetune(n_epoch = 5, #---
+                    learning_rate = 5e-4,
+                    train_print_per_n = 5,
+                    valid_per_n = 20,
+                    weight_decay = weight_decay,)
 
     print(f"time it took for this training iteration: {time.time() - strt}")
     if save_dir is not None:

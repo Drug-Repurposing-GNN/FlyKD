@@ -15,6 +15,7 @@ __pycache__/
 *.pth
 
 # Distribution / packaging
+txgnn/data_splits/
 wandb/
 .Python
 build/
