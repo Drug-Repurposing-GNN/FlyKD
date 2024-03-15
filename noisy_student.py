@@ -106,7 +106,7 @@ can be retained")
         for i, _ in enumerate(range(args.iter + 1)):
             save_dir, log_file = init_logfile(i, seed, args)
 
-            diff_epochs = f"Results_e{args.epochs}" if args.epochs else ""
+            diff_epochs = f"e{args.epochs}" if args.epochs else ""
             pretrained_path = f"./pretrained_models/{args.teacher_size}_{diff_epochs}/{seed}" 
             ith_model_ckpt = f"{save_dir}{i}_model_ckpt/" 
                 
