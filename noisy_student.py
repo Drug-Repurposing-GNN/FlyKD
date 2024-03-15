@@ -13,12 +13,7 @@ import argparse
 import os
 import random
 import datetime
-'''
-    Let's first try one iteration to increase performance.
-'''
 if __name__ == '__main__':
-
-
     parser = argparse.ArgumentParser()
     parser.add_argument('--dropout', default=0.0, type=float, help="add dropout at layer 1")
     parser.add_argument('--reparam_mode', default=False, help='choose from {MLP, RMLP, MPNN}')
@@ -124,7 +119,7 @@ can be retained")
                     ## Use teacher size for first model (teacher model)
                     size = args.teacher_size 
                     ## training function
-                    print("Training *without* pseudo labels")
+                    print("Training Teacher Model")
                     train_w_psuedo_labels(None, None, seed, pretrained_path, args, size=size, i=i)
                 else:
                     print_val_test_auprc_w_path(pretrained_path, split=args.split, seed=seed)

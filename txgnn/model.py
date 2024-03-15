@@ -99,7 +99,6 @@ class DistMultPredictor(nn.Module):
             disease_nodes = ['disease', 'gene/protein']
             
             ## Precompute all similarity 
-            # etypes = self.wrev_disease_etypes_all ## For simplicity. Overcomputing things, but they are done only once anyway.
             etypes = self.disease_etypes_all #if LSP_size else self.etypes_dd
             all_disease_ids = torch.arange(G.num_nodes("disease"))
             path = f"./data/{split}_{seed}"
@@ -111,6 +110,7 @@ class DistMultPredictor(nn.Module):
                 with open(f"{path}/diseases_profile_etypes.pkl", "rb") as file3:
                     self.diseases_profile_etypes = pickle.load(file3) 
             else:
+                print("precomputing the similarity matrix for fast disease pooling mechanism...")
                 if sim_measure == 'all_nodes_profile':
                     diseases_profile = {i.item(): obtain_disease_profile(G, i, disease_etypes, disease_nodes) for i in all_disease_ids}
                 elif sim_measure == 'protein_profile':
@@ -135,10 +135,6 @@ class DistMultPredictor(nn.Module):
                     if not (src == "disease" or dst == "disease"):
                         print("computing simlarity between two non-disease entities is pointless")
                         raise KeyError
-                    # if src == 'disease':
-                    #     all_disease_ids_prune = torch.where(G.out_degrees(etype=etype) != 0)[0]
-                    # elif dst == 'disease':
-                    #     all_disease_ids_prune = torch.where(G.in_degrees(etype=etype) != 0)[0]
                     self.sim_all_etypes[etype] = sim_all
                     self.diseaseid2id_etypes[etype] = diseaseid2id
                     self.diseases_profile_etypes[etype] = diseases_profile
@@ -149,6 +145,7 @@ class DistMultPredictor(nn.Module):
                     pickle.dump(self.diseaseid2id_etypes, file2)
                 with open(f"{path}/diseases_profile_etypes.pkl", "wb") as file3:
                     pickle.dump(self.diseases_profile_etypes, file3)
+                print("Done!")
 
 
     def apply_edges(self, edges):
@@ -170,59 +167,24 @@ class DistMultPredictor(nn.Module):
         elif LSP == "RBF":
             assert sigma is not None
             f_sim = lambda src, dst: torch.exp(-((src - dst).norm(p=2, dim=1)**2) / (2 * sigma ** 2))
-        # elif sim == "L2":
-        #     f_sim = torch.nn.CosineSimilarity(dim=1)
-        # elif sim == "L2":
-        #     f_sim = torch.nn.CosineSimilarity(dim=1)
         else:
             raise KeyError
 
-        # with graph.local_scope():
-        # is_src_dis = etype[0] ==  "disease"
         def apply_f_sim(edges):
-            # result = {'sim_score': f_sim(edges.src['h'], edges.dst['h']).unsqueeze(-1)}
             result = {'sim_score': f_sim(edges.src['h'], edges.dst['h'])}
             return result ## useful for concatenation like [] + []
 
-        # for etype in self.disease_etypes_all:
         graph.apply_edges(apply_f_sim, etype=etype)
-        # for node in disease_nodes:
         src_type, dst_type = etype[0], etype[2]
         non_dis = src_type if dst_type == "disease" else dst_type
         src, dst = graph.edges(etype=etype)
         edge_data = graph.edges[etype].data["sim_score"]#.to(self.device)
-        # edge_ids = torch.arange(len(src))
-        # if src_type == "disease":
-        #     print(LS[0].shape)
-        #     LS[src] = torch.cat([LS[src], edge_data[edge_ids]], dim=-1)
-        #     print(LS[0].shape)
-        # elif src_type == "disease":
-        #     LS[dst] = torch.cat([LS[dst], edge_data[edge_ids]], dim=-1)
-
-        # def append_LS(LS, key, value):
-        #     if len(LS[key]) == 0:
-        #         LS[key] = value
-        #     else:
-        #         LS[key].append(value)
-                # LS[key] = torch.cat([LS[key], value])
-        # disease_nodes = graph.nodes("disease")
 
         ## Pretty sure you only compute LSP when graph = G
         if src_type == "disease":
             sparse_LS_list.append({'indices': torch.stack([src, dst]), 'values': edge_data, 'column_size': graph.num_nodes(dst_type)})
         else:
             sparse_LS_list.append({'indices': torch.stack([dst, src]), 'values': edge_data, 'column_size': graph.num_nodes(src_type)})
-        # LS = LS + temp
-
-        # for i, (src, dst) in enumerate(zip(src, dst)):
-        #     if src in disease_nodes:
-        #         LS[src.item()].append(edge_data[i])
-        #         # append_LS(LS, src.item(), edge_data[i])
-        #     elif dst in disease_nodes:
-        #         LS[dst.item()].append(edge_data[i])
-                # append_LS(LS, dst.item(), edge_data[i])
-        # print(f"applying f_sim {inter - strt}")
-        # print(f"appending vector to LS dictionary {time.time() - strt}")
 
     ## pseudo_training disabled dpm
     def forward(self, graph, G, h, pretrain_mode, mode, block = None, only_relation = None, keep_grad_for_sl=False, LSP=False, LSP_size=None, sigma=None, verbose=False):
@@ -233,11 +195,7 @@ class DistMultPredictor(nn.Module):
             if len(graph.canonical_etypes) == 1:
                 etypes_train = graph.canonical_etypes
             else:
-            #     etypes_train = self.etypes_dd
-            # if pseudo_training:
                 etypes_train = self.restrained_dd_etypes #### IMPORTANT #### RESTRAINING DD_RELATIONS (No-rev, No off-label)
-                # etypes_train = graph.canonical_etypes ## if you are going to use psuedo labels and skip (off-label relations)
-                # print(etypes_train) #### test ####: this should be only ind, c-ind
 
             if only_relation is not None:
                 if only_relation == 'indication':
@@ -264,8 +222,6 @@ class DistMultPredictor(nn.Module):
                     scores[etype] = out
             else:
                 # finetuning on drug disease only...
-
-
                 ## It seems like disease, disease_proteins are only used for "all_nodes_profile" DPM
                 if LSP_size == "full":
                     etypes = self.disease_etypes_all

@@ -9,10 +9,6 @@ import sys
 import pprint
 import random
 
-'''
-    Let's first try one iteration to increase performance.
-'''
-
 def obtain_disease_idx(TxData1, deg):
     '''
         returns the disease idx that have less than k degrees (drug-disease relation)
