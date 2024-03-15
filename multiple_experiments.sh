@@ -1,10 +1,11 @@
 ######################################### Script Examples #########################################
-## OG FlyKD on seed 45
-python -u noisy_student.py NS_130to80_soft_pseudo_flyKD_curr1 --set_seed 45 --teacher_size 130 --student_size 80 --iter 1\
-    --limited_neg_pseudo_sampling --soft_pseudo --random_pseudo_k 100000 --on_the_fly_KD --rel_multinomial_ptrain --epochs 2000 --curriculum1
+## student model baseline (130, 80) without KD
+# python -u noisy_student.py proper_130_e2000_90 --set_seed 45 --teacher_size 130 --epochs 2000 --save_model
+python -u noisy_student.py proper_80_e2000_90 --set_seed 45 --teacher_size 80 --epochs 2000 --save_model
 
-## student model baseline without KD
-python -u noisy_student.py proper_80_e1200_90 --set_seed 45 --teacher_size 80
+## OG FlyKD on seed 45
+# python -u noisy_student.py NS_130to80_soft_pseudo_flyKD_curr1 --set_seed 45 --teacher_size 130 --student_size 80 --iter 1\
+#     --limited_neg_pseudo_sampling --soft_pseudo --random_pseudo_k 100000 --on_the_fly_KD --rel_multinomial_ptrain --epochs 2000 --curriculum1
 
 ## FlyKD (configuration: decrease entropy of probability distribution of Random Graph)
 # python -u noisy_student.py NS_130to80_soft_pseudo_flyKD_curr1_modprob --set_seed 45 --teacher_size 130 --student_size 80 --iter 1\
