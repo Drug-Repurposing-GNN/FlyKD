@@ -1,6 +1,6 @@
 ## Dear visitors, we really appreciate your stars!
 
-### Website(TBD) and Paper(TBD)
+### <a href="https://github.com/Drug-Repurposing-GNN/Drug-Repurposing-Website/tree/main">Website </a> and Paper(TBD)
 
 ### System Profile: 
 - Cuda Profile: 11.8
