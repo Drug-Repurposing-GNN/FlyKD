@@ -1,6 +1,6 @@
 ## Dear visitors, we really appreciate your stars!
 
-### <a href="https://drug-repurposing-gnn.github.io/Drug-Repurposing-Website">Website </a> and Paper(TBD)
+### <a href="https://drug-repurposing-gnn.github.io/Drug-Repurposing-Website">Website </a> and <a href="https://drive.google.com/file/d/148UQyEkZ6p4ZGRXUR3hh5w5m7xPlSrUP/view?usp=sharing">Paper</a>
 
 ### System Profile: 
 - Cuda Profile: 11.8
@@ -16,7 +16,7 @@
 
 `wget -O kg.csv https://dataverse.harvard.edu/api/access/datafile/6180620`
 
-5. Run bash script (results will be stored in `Results_e2000/` folder)
+5. Run bash script (results will be stored in `Results_e2000/`)
 
 `. multiple_experiments.sh`
 
