@@ -16,7 +16,7 @@
 
 `wget -O kg.csv https://dataverse.harvard.edu/api/access/datafile/6180620`
 
-5. Run bash script (results will be stored in `Results_e2000/`)
+4. Run bash script (results will be stored in `Results_e2000/`)
 
 `. multiple_experiments.sh`
 
